@@ -1,0 +1,14 @@
+# 临时运行产物
+night_run.log
+.status
+.pid.main
+.pid.watchdog
+.task.md
+.task.md.raw
+
+# Claude 本地记忆/会话
+.claude/
+
+# 系统文件
+.DS_Store
+*.swp
