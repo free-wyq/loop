@@ -91,6 +91,18 @@ watchdog_mode() {
       fi
     else
       # 主进程没了，重新拉起（不带 --watchdog，所以它会走主逻辑）
+      # 但如果任务已全部完成（.status 显示 remaining=0），就别重启了
+      local done_flag=0
+      if [ -f "$STATUS_FILE" ]; then
+        local s_rm
+        s_rm=$(grep "remaining:" "$STATUS_FILE" | awk '{print $2}')
+        [ "${s_rm:-0}" -eq 0 ] && done_flag=1
+      fi
+      if [ "$done_flag" -eq 1 ]; then
+        log "[WATCHDOG] 主进程已退出且任务全部完成，看门狗也退出"
+        rm -f "$WDOG_PID_FILE"
+        exit 0
+      fi
       log "[WATCHDOG] ⚠️ 主进程不存在，重新拉起..."
       nohup "$0" --internal-resume > /dev/null 2>&1 &
       echo $! > "$MAIN_PID_FILE"
@@ -122,10 +134,16 @@ main_loop() {
       write_status "completed" "全部完成" 0 "$TOTAL"
       rm -f "$MAIN_PID_FILE"
       # 任务全部完成，停止看门狗，否则它会无限重启主进程
+      # 注意：看门狗是 nohup 派生的兄弟进程，不是本进程的子进程，
+      # kill_tree 的 pgrep -P 找不到它，必须直接按 PID 杀
       if is_running "$WDOG_PID_FILE"; then
-        kill_tree "$(cat "$WDOG_PID_FILE")" 2>/dev/null
+        local wpid
+        wpid=$(cat "$WDOG_PID_FILE" 2>/dev/null)
+        # 先杀看门狗，再杀它的子进程（看门狗可能派生了主进程）
+        kill -9 "$wpid" 2>/dev/null || true
+        kill_tree "$wpid" 2>/dev/null
         rm -f "$WDOG_PID_FILE"
-        log "🛑 看门狗已随任务完成而退出"
+        log "🛑 看门狗已随任务完成而退出 (PID=$wpid)"
       fi
       exit 0
     fi
