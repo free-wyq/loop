@@ -4,13 +4,23 @@
 
 > 核心理念：**重但稳 + 使用简单**。长跑拆成幂等单步 `tick`，状态双层落盘，进程崩溃天然可恢复；用户视角只一条命令跑到底，调度器中立不绑任何外部 agent。
 
-## 安装（一条命令，agent 无关）
+## 安装
+
+两种入口，装的是同一个 `install.sh`——按你是人还是智能体挑一个：
+
+### 方式一 · `.sh`：一条命令（人 / 智能体直接执行）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/free-wyq/loop/main/install.sh | bash
 ```
 
-装到中立路径（不碰任何 agent 私有目录），装完即用 `loop --cwd <项目> "目标"`。卸载/重装/升级见 [install.md](install.md)。
+### 方式二 · `.md`：给智能体读（它读完自行装）
+
+把 [install.md](install.md) 发给你的 AI 助手——它读懂后按文档执行上面的 bash 即可装好。适合让 agent 自主配置、或不想手动敲命令的场景。
+
+---
+
+两种方式都装到中立路径（不碰任何 agent 私有目录），装完即用 `loop --cwd <项目> "目标"`。卸载/重装/升级见 [install.md](install.md)。
 
 ---
 
