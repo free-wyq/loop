@@ -34,7 +34,15 @@ orchestrator 暴露的唯一接口是幂等单步 `orchestrator.ts --tick`：取
 
 原则：**只在状态变化或需人工介入时输出**。正常推进（advanced）可选推或不推——嫌吵在 wrapper 里把它改静默，只推 terminated/blocked。
 
-## 安装（通用三步，任一调度器通用）
+## 安装
+
+**推荐：一条命令（装好 `loop`/`loop-tick` 到 `~/.local/bin`，自动配 wrapper + conf）**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/free-wyq/loop/main/install.sh | bash
+```
+
+下面是手动装 wrapper 的方式（已有 loop 仓库源码、不想用 install.sh 时）：
 
 ### 1. wrapper 就位 + 配目标项目
 
@@ -59,7 +67,7 @@ cp /path/to/loop/skill/loop-tick.conf.example ~/.config/loop-tick.conf
 loop-tick   # 手动跑一次
 ```
 
-期望：进目标项目、调 `tsx orchestrator.ts --tick`、stdout 输出一行 `✅/🏁/🚧/🧠` 摘要或空。看 `night_run.log` 里有 `tick 结果: <kind>`。
+期望：进目标项目、调 `loop --tick`（或 `orchestrator.ts --tick`）、stdout 输出一行 `✅/🏁/🚧/🧠` 摘要或空。看 `night_run.log` 里有 `tick 结果: <kind>`。
 
 ### 3. 接到你的调度器
 
@@ -87,10 +95,10 @@ ln -sf /path/to/loop/skill/loop-tick.sh ~/.hermes/scripts/loop-tick.sh
 
 | 操作 | 命令 |
 |---|---|
-| 实时状态 | `tsx orchestrator.ts --cwd <proj> --status` |
-| 运行报告 | `tsx orchestrator.ts --cwd <proj> --report` |
-| 临时停 | `tsx orchestrator.ts --cwd <proj> --stop`（写 .stop 哨兵；下次 tick 自动 stopped） |
-| 恢复 | `tsx orchestrator.ts --cwd <proj> --resume`（删 .stop） |
+| 实时状态 | `loop --cwd <proj> --status` |
+| 运行报告 | `loop --cwd <proj> --report` |
+| 临时停 | `loop --cwd <proj> --stop`（写 .stop 哨兵；下次 tick 自动 stopped） |
+| 恢复 | `loop --cwd <proj> --resume`（删 .stop） |
 | 改间隔 | 改你那个调度器的 schedule（cron/edit timer/hermes cron edit），不动 wrapper |
 
 ## 崩溃恢复（自动，无需人工）

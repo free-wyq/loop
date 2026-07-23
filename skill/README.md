@@ -17,11 +17,19 @@ orchestrator 暴露幂等单步接口 `orchestrator.ts --tick`（取一个未完
 | `loop-tick.sh` | wrapper 本体（替调度器敲 `--tick` + outcome→stdout 映射） |
 | `loop-tick.conf.example` | 目标项目配置模板（拷成 `~/.config/loop-tick.conf`） |
 
-## 安装（通用三步）
+## 安装
+
+**推荐：一条命令（装好 `loop`/`loop-tick` 到 `~/.local/bin`，自动配 wrapper + conf）**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/free-wyq/loop/main/install.sh | bash
+```
+
+下面是手动装 wrapper 的方式（已有 loop 仓库源码、不想用 install.sh 时）：
 
 ```bash
 # 1. wrapper 就位（symlink 进 PATH，本体留仓库跟版本走）
-ln -sf /path/to/loop/skill/loop-tick.sh /usr/local/bin/loop-tick
+ln -sf /path/to/loop/skill/loop-tick.sh /usr/local/bin/loop-tick   # 或 ~/bin，加进 PATH
 chmod +x /path/to/loop/skill/loop-tick.sh
 cp /path/to/loop/skill/loop-tick.conf.example ~/.config/loop-tick.conf
 # 编辑 ~/.config/loop-tick.conf 填 LOOP_PROJECT=<你的目标项目>
