@@ -43,9 +43,11 @@ cd "$PROJ" 2>/dev/null || { echo "❌ loop-tick: 目标目录不存在 $PROJ"; e
 
 LOG="night_run.log"
 
-# 跑单步 tick：全量输出 tee 进日志，同时抓 "tick 结果: <kind>" 判定本轮 outcome
-outcome_line=$("${RUN[@]}" "$ORCH" --cwd "$PROJ" --tick 2>&1 | tee -a "$LOG" \
-  | grep -E 'tick 结果:' | tail -1 || true)
+# 跑单步 tick：抓 "tick 结果: <kind>" 判定本轮 outcome。
+# 注意：不 tee 进 night_run.log——orchestrator 的 log() 已自己 appendFileSync 写日志，
+# 这里再 tee 会让每行重复一遍。wrapper 只 grep stdout 拿 outcome 行，日志由 orchestrator 独占。
+# （崩溃信息也已在 night_run.log：main().catch 走 log() 记录，stderr 上的 SDK 噪音不是我们的日志。）
+outcome_line=$("${RUN[@]}" "$ORCH" --cwd "$PROJ" --tick 2>&1 | grep -E 'tick 结果:' | tail -1 || true)
 kind=$(echo "$outcome_line" | sed -E 's/.*tick 结果: ([a-z_]+).*/\1/')
 [ -n "$kind" ] || kind="unknown"
 
