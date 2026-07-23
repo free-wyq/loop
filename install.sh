@@ -110,12 +110,10 @@ exec "'"$DEST"'/node_modules/.bin/tsx" "'"$DEST"'/orchestrator.ts" "$@"
   echo "  看状态：    loop --cwd /path/to/your/project --status"
   echo "  接定时器：  loop-tick /path/to/your/project"
   echo
-  echo "  注册 skill（可选，本脚本不替你做，用 symlink 不复制）："
-  echo "    ln -sf $DEST/skill ~/.claude/skills/loop-scheduler     # Claude Code"
-  echo "    ln -sf $DEST/skill ~/.codex/skills/loop-scheduler      # Codex"
-  echo "    ln -sf $DEST/skill ~/.gemini/skills/loop-scheduler     # Gemini CLI"
-  echo
   echo "  ⚠️ --cwd 指向你要开发的目标项目，别指向 loop 仓库自身。"
+  echo
+  echo "  注册 skill（可选；多数 agent 的扫描器不跟 symlink，要拷真目录）："
+  echo "    cp -r $DEST/skill ~/.claude/skills/loop-scheduler   # Claude Code（换 agent 换目录）"
   echo "  卸载：bash $DEST/install.sh uninstall"
 }
 
@@ -134,8 +132,9 @@ do_uninstall() {
     removed=1
   fi
 
-  # 3. 清各 agent skills 目录里的 loop-scheduler symlink
-  #    （只清指向我们 DEST、或因 DEST 已删而悬空的；指向别处的不动）
+  # 3. 清各 agent skills 目录里的 loop-scheduler（symlink 或真目录拷贝都清）
+  #    - symlink：只清指向我们 DEST、或因 DEST 已删而悬空的；指向别处的不动
+  #    - 真目录：若含 SKILL.md 且 name 是 loop-scheduler，视为我们的拷贝，删
   for d in "${AGENT_SKILL_DIRS[@]}"; do
     local lk="$d/loop-scheduler"
     if [ -L "$lk" ]; then
@@ -145,15 +144,20 @@ do_uninstall() {
         *) # 悬空链接（目标已不存在）也清
           [ -e "$tgt" ] || { rm -f "$lk"; say "清悬空 skill symlink：$lk"; removed=1; } ;;
       esac
+    elif [ -d "$lk" ] && [ -f "$lk/SKILL.md" ]; then
+      # 真目录拷贝：靠 SKILL.md frontmatter 的 name 字段确认是我们的，再删
+      if grep -q '^name: *loop-scheduler' "$lk/SKILL.md" 2>/dev/null; then
+        rm -rf "$lk"; say "清 skill 目录：$lk"; removed=1
+      fi
     fi
   done
 
-  # 4. 删代码目录（最后删，保证上面的 symlink 悬空检测先跑）
+  # 4. 删代码目录（最后删，保证上面的悬空检测先跑）
   if [ -d "$DEST" ]; then rm -rf "$DEST"; removed=1; fi
 
   if [ "$removed" = 1 ]; then
     echo
-    say "已卸载 loop-orchestrator（代码/命令/skill symlink 已清，配置留 .bak 备份）"
+    say "已卸载 loop-orchestrator（代码/命令/skill 已清，配置留 .bak 备份）"
   else
     warn "未检测到 loop-orchestrator 的安装痕迹，无需卸载"
   fi

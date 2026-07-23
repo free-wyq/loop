@@ -44,6 +44,20 @@ loop-tick
 # OpenClaw/其他:   当一条可定时执行的命令调即可
 ```
 
+## 注册成当前 agent 的 skill（可选）
+
+多数 agent 的 skill 扫描器用 find/glob 遍历 skills 目录，**默认不跟符号链接进子目录**——symlink 一个 skill 目录进去，扫描器看不见它。所以要拷成真目录：
+
+```bash
+# 1. 推理你 agent 的 skills 目录（常见位置：Claude Code ~/.claude/skills ·
+#    Codex ~/.codex/skills · Gemini CLI ~/.gemini/skills · Cursor ~/.cursor/skills · Hermes ~/.hermes/skills）
+SKILLS_DIR=~/.claude/skills
+# 2. 拷成真目录（loop 升级后重跑这两行刷新 skill 内容）
+mkdir -p "$SKILLS_DIR"; rm -rf "$SKILLS_DIR/loop-scheduler"
+cp -r /path/to/loop/skill "$SKILLS_DIR/loop-scheduler"
+# 3. 验证扫描器能看到：find "$SKILLS_DIR/loop-scheduler" -name SKILL.md 应返回一行
+```
+
 ## outcome → stdout
 
 | kind | 推送 |
