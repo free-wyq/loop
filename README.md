@@ -18,108 +18,39 @@ npx tsx orchestrator.ts --cwd /path/to/project "构建一个 Go REST API"
 ```mermaid
 flowchart TB
     User([用户 / 外部调度器])
-
-    subgraph Modes["两种运行模式"]
-        direction LR
-        WATCH["--watch<br/>自驱：bootstrap + while tick()"]
-        TICK["--tick<br/>单步：做一件事就退出"]
-    end
-
-    User -->|裸跑 / --watch| WATCH
-    User -->|--tick| TICK
-
-    subgraph Core["orchestrator.ts（进程内）"]
-        direction TB
-        BOOT["bootstrapTasks<br/>首跑拆任务 → .task.md"]
-        TICKFN["tick() 无状态单步<br/>16 步幂等"]
-
-        subgraph SDK["@anthropic-ai/claude-agent-sdk"]
-            QUERY["query()<br/>进程内异步生成器"]
-            HOOKS["PostToolUse hook<br/>实时捕文件写入"]
-            WD["abortController<br/>事件驱动看门狗"]
-        end
-
-        BOOT --> TICKFN
-        TICKFN -->|"每个未完成任务"| QUERY
-        QUERY -.-> HOOKS
-        QUERY -.-> WD
-        HOOKS -->|"wroteFiles"| TICKFN
-        QUERY -->|"结构化结果<br/>cost/session_id/subtype"| TICKFN
-    end
-
-    subgraph Persist["双层持久化（目标项目目录）"]
-        direction LR
-        STATE[("state.json<br/>恢复点·原子写<br/>cost/轮次/空转/commit/终止标记")]
-        EVENTS[("events.jsonl<br/>审计流·append-only<br/>tick_started⇄completed 配对")]
-        TASK[(".task.md<br/>任务进度真相源<br/>[ ]/[x]/[~]")]
-        SESS[(".session_id<br/>会话单源")]
-        STOP[(".stop 哨兵")]
-        LOCK[(".tick.lock<br/>proper-lockfile")]
-    end
-
-    TICKFN -->|"阶段A 立即写成本"| STATE
-    TICKFN --> STATE
-    TICKFN --> EVENTS
-    TICKFN --> TASK
-    TICKFN --> SESS
-    TICKFN -.-> STOP
-    TICKFN -.-> LOCK
-
-    subgraph Obs["观测命令"]
-        STATUS["--status"]
-        REPORT["--report"]
-    end
-    STATUS --> STATE
-    STATUS --> EVENTS
-    REPORT --> EVENTS
+    User -->|"--watch 自驱 / --tick 单步"| BOOT[bootstrap 拆任务 → .task.md]
+    BOOT --> TICK["tick()<br/>幂等单步"]
+    TICK --> SDK["SDK query()<br/>PostToolUse 捕真实改动<br/>看门狗 超时强杀"]
+    SDK --> TICK
+    TICK -->|"★成本立即写"| STATE[("state.json<br/>恢复点 · 原子写")]
+    TICK --> EVENTS[("events.jsonl<br/>append-only 审计")]
+    TICK --> TASK[(".task.md<br/>任务真相源")]
 
     style STATE fill:#e8f5e9
     style EVENTS fill:#e3f2fd
-    style TICKFN fill:#fff3e0
+    style TICK fill:#fff3e0
 ```
 
-### tick() 16 步控制流（崩溃恢复核心）
+### tick() 控制流（崩溃恢复核心）
 
 ```mermaid
 flowchart TD
-    Start([tick 入口]) --> L0["步骤0 flock 非阻塞<br/>拿不到 → already_running"]
-    L0 --> L1["步骤1 读 state.json 恢复"]
-    L1 --> L2{"步骤2 .stop 哨兵?"}
-    L2 -->|是| Stopped([stopped])
-    L2 -->|否| L3{"步骤3 last_termination?"}
-    L3 -->|有| AT([already_terminated<br/>防 cron 空转刷屏])
-    L3 -->|无| L4["步骤4 读 .task.md<br/>取第一个 [ ]"]
-    L4 --> L5["步骤5 append tick_started"]
-    L5 --> L6{"步骤6 remaining=0?"}
-    L6 -->|是, 有阻塞或零commit| SFC([疑假完成<br/>不设终止标记 待人工])
-    L6 -->|是, 干净| Done([done 设终止标记])
-    L6 -->|否| L7{"步骤7 预算耗尽?"}
-    L7 -->|是| BE([budget_exceeded])
-    L7 -->|否| L8["步骤8 stallTask 跨tick reset"]
-    L8 --> L9["步骤9 loop_count++ 写盘 running"]
-    L9 --> L10["步骤10 读 .session_id"]
-    L10 --> L11["步骤11 runOneTask<br/>query + PostToolUse + 看门狗"]
-    L11 --> L12["★步骤12 阶段A<br/>成本立即写 state.json<br/>在打勾/commit 之前"]
-    L12 --> L13["步骤13 session_id 更新"]
-    L13 --> L14{"步骤14 abort/<br/>ctx-overflow?"}
-    L14 -->|是| SD["弃会话 session_retries++<br/>≥3 次标阻塞防死循环"]
-    L14 -->|否, 单任务预算耗尽| TB(["标阻塞 不弃会话"])
-    SD --> SDC([session_dropped])
-    TB --> B2([blocked])
-    L14 -->|否| L15{"步骤15 didRealWork?<br/>wroteFiles.length>0"}
-    L15 -->|是| ADV["打勾 + commit +<br/>reset 空转/重试计数"]
-    L15 -->|否| STALL["stall_count++<br/>≥3 标阻塞"]
-    ADV --> L16(["advanced"])
-    STALL --> L16b(["stalled / blocked"])
-    L16 --> L17["步骤16 写 state.json<br/>+ 派生 .status<br/>+ tick_completed"]
-    L16b --> L17
-    SDC --> L17
-    B2 --> L17
-    L17 --> Release(["finally 释放 flock"])
+    Start([tick 入口]) --> Lock["flock<br/>拿不到→already_running"]
+    Lock --> Check{"已停 / 已完成?"}
+    Check -->|是| Exit([直接退出])
+    Check -->|否| Run["读任务 → runOneTask<br/>query+hook+看门狗"]
+    Run --> PhaseA["★阶段A<br/>成本立即写 state.json"]
+    PhaseA --> Judge{"结果?"}
+    Judge -->|崩溃/超时| Drop["弃会话重试<br/>连续3次标阻塞"]
+    Judge -->|真改动| Adv["打勾+commit<br/>reset 计数"]
+    Judge -->|空转| Stall["空转计数<br/>满3标阻塞"]
+    Drop --> Write(["写盘 + tick_completed"])
+    Adv --> Write
+    Stall --> Write
+    Write --> Release(["释放锁"])
 
-    style L12 fill:#fff3e0
-    style SFC fill:#ffebee
-    style L11 fill:#e3f2fd
+    style PhaseA fill:#fff3e0
+    style Run fill:#e3f2fd
 ```
 
 ### 崩溃恢复时序
