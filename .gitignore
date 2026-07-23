@@ -8,6 +8,13 @@ night_run.log
 .task.md
 .task.md.raw
 
+# tick 化新增产物
+state.json
+events.jsonl
+.stop
+.tick.lock
+.tick.lock.lock
+
 # Claude 本地记忆/会话
 .claude/
 

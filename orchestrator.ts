@@ -1,39 +1,67 @@
-// orchestrator.ts —— SDK 版 24h 无人值守开发 orchestrator
+// orchestrator.ts —— SDK 版 24h 无人值守开发 orchestrator（tick 化 + 事件溯源）
 //
 // 用法：
-//   npx tsx orchestrator.ts [--cwd <项目目录>] "目标"   # 启动（拆任务 + 主循环）
-//   npx tsx orchestrator.ts [--cwd <项目目录>] --status  # 看实时状态
-//   npx tsx orchestrator.ts [--cwd <项目目录>] --stop    # 停止
-//   npx tsx orchestrator.ts [--cwd <项目目录>] --report  # 报告
+//   npx tsx orchestrator.ts [--cwd <项目目录>] "目标"           # 裸跑=--watch（自驱：bootstrap+while(tick)）
+//   npx tsx orchestrator.ts [--cwd <项目目录>] --watch "目标"    # 显式自驱
+//   npx tsx orchestrator.ts [--cwd <项目目录>] --tick           # 单步（hermes cron / 手动，幂等可恢复）
+//   npx tsx orchestrator.ts [--cwd <项目目录>] --status         # 读 state.json + events.jsonl 末尾
+//   npx tsx orchestrator.ts [--cwd <项目目录>] --report         # 读 events.jsonl 统计 + night_run.log grep 兜底
+//   npx tsx orchestrator.ts [--cwd <项目目录>] --stop            # 写 .stop 哨兵 + 杀 --watch PID
+//   npx tsx orchestrator.ts [--cwd <项目目录>] --resume         # 删 .stop 哨兵
 //
 // --cwd 指定目标项目目录（产物写入处 + git commit 的仓库 + 会话工作目录）；不传则用当前目录。
 //
-// 会话策略：首轮新会话（query 返回的 session_id 落盘），后续轮 resume 同一会话；
-// 永不使用 continue（避免旧会话污染）。
+// 会话策略：首轮新会话（query 返回的 session_id 落盘 .session_id），后续轮 resume 同一会话；
+// 永不使用 continue（避免旧会话污染）。session_id 由 .session_id 文件单源管理（不进 state.json）。
+//
+// 设计原则：调度器中立。tick 是无状态单步、幂等、可恢复；state.json/events.jsonl 双层持久化；
+// hermes cron / 系统 crontab / 手敲 --tick 都能驱动，orchestrator 本身不绑任何外部 agent。
+// 「稳」相关全交给成熟库：proper-lockfile 管锁（stale/fsync 全套）、write-file-atomic 管原子写（data+dir fsync）。
 
 import { query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { parseArgs as nodeParseArgs } from "node:util";
+import lockfile from "proper-lockfile";
+
+// write-file-atomic v7 不自带类型且 @types 版本滞后。用 ambient 声明（单独 .d.ts 文件，
+// TS 对「untyped module」不允许 inline declare module 增强，必须外置）。见 write-file-atomic.d.ts。
+import writeFileAtomic from "write-file-atomic";
+const writeAtomic = (path: string, data: string) => writeFileAtomic.sync(path, data);
 
 // ---------------- 配置 ----------------
 
 const TASK_FILE = ".task.md";
 const LOG_FILE = "night_run.log";
-const STATUS_FILE = ".status";
+const STATUS_FILE = ".status";          // 派生的人类可读快照（--status 主读 state.json，这个留兜底）
 const MEMO_DIR = ".claude/memory";
-const SESSION_FILE = ".session_id";
-const PID_FILE = ".pid";
+const SESSION_FILE = ".session_id";      // session_id 单源（不进 state.json）
+const PID_FILE = ".pid";                // --watch 进程的 PID
+
+// 陷阱1/2：新增持久化与锁文件
+const STATE_FILE = "state.json";        // 机器读恢复点快照（原子写）
+const EVENTS_FILE = "events.jsonl";     // append-only 审计流
+const STOP_FILE = ".stop";              // 陷阱3：.stop 哨兵取代 --stop 杀进程（tick 是短进程，杀完 cron 又来）
+const LOCK_FILE = ".tick.lock";          // 陷阱2：flock 进程级并发保护（hermes cron overlap 只去同 job_id，不管 --watch 与 --tick 并发）
 
 const MAX_TURNS_PER_TASK = 60;      // 单任务 agentic 轮上限（防一个任务跑飞）
 const MAX_BUDGET_PER_TASK = 3;      // 单任务美元上限
 const MAX_BUDGET_TOTAL = 50;        // 全程美元上限（24h 护栏）
 const STALL_LIMIT = 3;              // 同任务连续零改动 N 次标阻塞
 const ABORT_TIMEOUT_MIN = 60;       // 单任务超 N 分钟无进展则 abort 重试
+const SESSION_RETRY_LIMIT = 3;      // 陷阱7：当前任务连续 session_dropped N 次标阻塞（防 ctx-overflow 死循环）
+const WATCH_SLEEP_MS = 5_000;       // --watch tick 间隔
+const ALREADY_RUNNING_SLEEP_MS = 30_000; // 拿不到锁时的退避
+const LOCK_STALE_MS = 60_000;        // 锁 stale 阈值：proper-lockfile 自动检测并 takeover（进程 kill -9 后 60s 可被抢）
 
 // ---------------- 工具函数 ----------------
 
 const now = () => new Date().toISOString().replace("T", " ").slice(0, 19);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// roundCost: 保留 6 位小数，防浮点累计误差
+const roundCost = (n: number): number => Math.round((n + Number.EPSILON) * 1e6) / 1e6;
 
 function log(msg: string) {
   const line = `[${now()}] ${msg}`;
@@ -92,27 +120,37 @@ function currentTaskLine(): string | null {
   return null;
 }
 
-// 把第一个未完成任务行打勾 [ ]→[x]
+function countBlocked(): number {
+  if (!existsSync(TASK_FILE)) return 0;
+  return (readFileSync(TASK_FILE, "utf8").match(/^- \[~\]/gm) || []).length;
+}
+
+// 陷阱1: 原子写（write-file-atomic 处理 data fsync + dir fsync 顺序，崩溃后元数据不丢）
+function atomicWriteFile(path: string, content: string) {
+  writeAtomic(path, content);
+}
+
+// 把第一个未完成任务行打勾 [ ]→[x]（陷阱1: 原子写）
 function tickFirst() {
   const text = readFileSync(TASK_FILE, "utf8");
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     if (/^- \[ \]/.test(lines[i])) {
       lines[i] = lines[i].replace(/^- \[ \]/, "- [x]");
-      writeFileSync(TASK_FILE, lines.join("\n"));
+      atomicWriteFile(TASK_FILE, lines.join("\n"));
       return;
     }
   }
 }
 
-// 标记阻塞 [ ]→[~]
+// 标记阻塞 [ ]→[~]（陷阱1: 原子写）
 function blockFirst() {
   const text = readFileSync(TASK_FILE, "utf8");
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     if (/^- \[ \]/.test(lines[i])) {
       lines[i] = lines[i].replace(/^- \[ \]/, "- [~]");
-      writeFileSync(TASK_FILE, lines.join("\n"));
+      atomicWriteFile(TASK_FILE, lines.join("\n"));
       return;
     }
   }
@@ -143,7 +181,7 @@ function gitCommitIfChanged(taskLine: string): boolean {
   return true;
 }
 
-// ---------------- 核心：单任务一轮 query ----------------
+// ---------------- 核心：单任务一轮 query（保留不变）----------------
 
 interface RoundOutcome {
   result: SDKResultMessage | null;
@@ -260,121 +298,435 @@ async function runOneTask(taskLine: string, sessionId: string | null, costSoFar:
   return { result: resultMsg, wroteFiles, toolCalls, aborted };
 }
 
-// ---------------- 主循环 ----------------
+// ---------------- state.json + events.jsonl 持久化 ----------------
 
-async function mainLoop() {
-  writeFileSync(PID_FILE, String(process.pid));
-  log(`orchestrator 主进程启动，PID=${process.pid}`);
+interface StateJson {
+  version: number;
+  goal: string;
+  total_cost_usd: number;
+  loop_count: number;
+  stall_task: string | null;       // taskLine.slice(0,120)，null=无空转
+  stall_count: number;              // stall_task 连续空转次数，满 STALL_LIMIT 标阻塞
+  had_any_commit: boolean;          // 防假完成守卫
+  session_retries: number;          // 陷阱7：当前任务连续 session_dropped 次数，满3标阻塞
+  status: string;
+  last_tick_at: string | null;
+  last_tick_id: string | null;
+  last_termination: { reason: "done" | "budget_exceeded"; ts: string } | null; // 陷阱4：防完成后续 cron 刷 done
+}
 
-  mkdirSync(MEMO_DIR, { recursive: true });
+const DEFAULT_STATE: StateJson = {
+  version: 1,
+  goal: "",
+  total_cost_usd: 0,
+  loop_count: 0,
+  stall_task: null,
+  stall_count: 0,
+  had_any_commit: false,
+  session_retries: 0,
+  status: "idle",
+  last_tick_at: null,
+  last_tick_id: null,
+  last_termination: null,
+};
 
-  // 会话策略：读已落盘的 session_id；没有则首轮开新会话
-  let sessionId: string | null = existsSync(SESSION_FILE)
-    ? readFileSync(SESSION_FILE, "utf8").trim() || null
-    : null;
+// 陷阱1: 原子写 state.json（write-file-atomic：data fsync + dir fsync，崩溃后元数据不丢，财务/进度数据不可丢）
+function writeStateJsonAtomic(s: StateJson) {
+  writeAtomic(STATE_FILE, JSON.stringify(s, null, 2) + "\n");
+}
 
-  let totalCost = 0;
-  let loopCount = 0;
-  let stallTask: string | null = null;
-  let stallCount = 0;
-  let hadAnyCommit = false;
+function readStateJson(): StateJson {
+  if (!existsSync(STATE_FILE)) return { ...DEFAULT_STATE };
+  try {
+    const obj = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+    // 防御：补齐可能缺失的字段（向前兼容）
+    return { ...DEFAULT_STATE, ...obj };
+  } catch {
+    log(`⚠️ state.json 解析失败，回退默认值`);
+    return { ...DEFAULT_STATE };
+  }
+}
 
-  while (true) {
+// ---- session_id 单源（.session_id 文件）----
+
+function readSessionId(): string | null {
+  if (!existsSync(SESSION_FILE)) return null;
+  const s = readFileSync(SESSION_FILE, "utf8").trim();
+  return s || null;
+}
+
+function writeSessionId(id: string) {
+  writeFileSync(SESSION_FILE, id);
+}
+
+function clearSessionId() {
+  rmSync(SESSION_FILE, { force: true });
+}
+
+// ---- events.jsonl 审计流 ----
+
+interface EventEnvelope {
+  ts: string;
+  type: string;
+  tick_id: string | null;
+  loop_count: number | null;
+  data: Record<string, unknown>;
+}
+
+// appendFileSync 单行 < PIPE_BUF 原子（Linux PIPE_BUF=4096，我们一行远小于）。
+function appendEvent(type: string, data: Record<string, unknown>, ctx?: { tick_id?: string | null; loop_count?: number | null }) {
+  const env: EventEnvelope = {
+    ts: now(),
+    type,
+    tick_id: ctx?.tick_id ?? null,
+    loop_count: ctx?.loop_count ?? null,
+    data,
+  };
+  appendFileSync(EVENTS_FILE, JSON.stringify(env) + "\n");
+}
+
+// 读 events.jsonl 末尾 N 条（解析失败的行跳过）
+function readEventsTail(n: number): EventEnvelope[] {
+  if (!existsSync(EVENTS_FILE)) return [];
+  const lines = readFileSync(EVENTS_FILE, "utf8").split("\n").filter(Boolean);
+  const tail = lines.slice(-n);
+  const out: EventEnvelope[] = [];
+  for (const l of tail) {
+    try { out.push(JSON.parse(l) as EventEnvelope); } catch { /* 跳过损坏行 */ }
+  }
+  return out;
+}
+
+// 统计 events.jsonl 中某类型事件数
+function countEvents(type: string): number {
+  if (!existsSync(EVENTS_FILE)) return 0;
+  const lines = readFileSync(EVENTS_FILE, "utf8").split("\n").filter(Boolean);
+  let c = 0;
+  for (const l of lines) {
+    try { if (JSON.parse(l).type === type) c++; } catch { /* skip */ }
+  }
+  return c;
+}
+
+// 生成 tick_id（时间戳 + 短随机，用于 tick_started/tick_completed 配对做崩溃检测）
+function genTickId(): string {
+  const d = new Date();
+  const ts = d.toISOString().replace(/[-:T]/g, "").slice(0, 14);
+  const rnd = Math.random().toString(36).slice(2, 6);
+  return `${ts}-${rnd}`;
+}
+
+// ---- flock：进程级并发保护（陷阱2，用 proper-lockfile）----
+
+let heldRelease: (() => void) | null = null;
+
+// 陷阱2: flock 进程级并发保护。
+// proper-lockfile 处理 stale lock（mtime 过期自动 takeover）、fsync 全套，24h 无人值守场景必用库。
+// 非阻塞语义：retries:0，拿不到锁抛 ELOCKED → 返回 already_running，不等待。
+// realpath:false —— 锁目标文件（.tick.lock）可能不存在，无需 canonicalize。
+function tryAcquireLock(): boolean {
+  try {
+    // lockSync 返回 release 函数；retries:0 = 非阻塞；stale:60s = 进程 kill -9 后 60s 可被抢
+    const release = lockfile.lockSync(LOCK_FILE, {
+      stale: LOCK_STALE_MS,
+      retries: 0,
+      realpath: false,
+    });
+    heldRelease = release;
+    return true;
+  } catch (e) {
+    const code = (e as { code?: string }).code;
+    if (code === "ELOCKED") return false; // 锁被占，非阻塞返回
+    // 其它错误（如权限）记日志后视为拿不到
+    log(`⚠️ lockfile.lockSync 异常: ${code ?? (e as Error).message}`);
+    return false;
+  }
+}
+
+function releaseLock() {
+  if (heldRelease) {
+    try { heldRelease(); } catch { /* 锁可能已被 stale takeover，释放失败忽略 */ }
+    heldRelease = null;
+  }
+  // 兜底：proper-lockfile release 会删 .lock 文件，但若已 stale 则可能残留
+  try { rmSync(LOCK_FILE + ".lock", { force: true }); } catch { /* 已删 */ }
+}
+
+// ---------------- tick()：无状态单步 ----------------
+
+type TickOutcome =
+  | { kind: "advanced" }
+  | { kind: "stalled" }
+  | { kind: "blocked" }
+  | { kind: "session_dropped" }
+  | { kind: "terminated" }
+  | { kind: "stopped" }
+  | { kind: "already_terminated" }
+  | { kind: "already_running" };
+
+// 16 步幂等单步：取第一个未完成任务 → runOneTask（核心不变）→ 判定 → 打勾/标阻塞 → commit → 落盘 → exit
+async function tick(): Promise<TickOutcome> {
+  // 步骤0: flock（陷阱2，proper-lockfile）
+  if (!tryAcquireLock()) {
+    appendEvent("tick_locked", { reason: "another tick holds lock" });
+    return { kind: "already_running" };
+  }
+
+  // 锁会在 finally 释放
+  let tickId: string | null = null;
+  try {
+    // 步骤1: 读 state.json（不存在用默认值）
+    const state = readStateJson();
+
+    // 步骤2: .stop 哨兵检查（陷阱3）—— 让 --watch 在下次 tick 退出
+    if (existsSync(STOP_FILE)) {
+      appendEvent("tick_skipped", { reason: "stop sentinel present" });
+      log("⏭️ .stop 哨兵存在，跳过本次 tick");
+      return { kind: "stopped" };
+    }
+
+    // 步骤3: last_termination 检查（陷阱4）—— 防 cron 完成后空转刷屏
+    if (state.last_termination) {
+      appendEvent("tick_skipped", { reason: "already_terminated", last_termination: state.last_termination });
+      return { kind: "already_terminated" };
+    }
+
+    // 步骤4: 读 .task.md，取 currentTaskLine，genTickId
     const { total, remaining } = readTasks();
+    const taskLine = currentTaskLine();
+    tickId = genTickId();
 
+    // 步骤5: append tick_started（与 tick_completed 配对做崩溃检测）
+    appendEvent("tick_started", { remaining, total, current_task: taskLine ?? null }, { tick_id: tickId, loop_count: state.loop_count + 1 });
+
+    // 步骤6: 终止判定 A: remaining=0
     if (remaining === 0) {
-      // 防假完成：有阻塞标记或全程零 commit → 不退出，挂起待人工核实
-      const text = existsSync(TASK_FILE) ? readFileSync(TASK_FILE, "utf8") : "";
-      const blocked = (text.match(/^- \[~\]/gm) || []).length;
-      if (blocked > 0) {
-        log(`⚠️ 检测到 ${blocked} 个 [~] 阻塞任务 + remaining=0：疑假完成，挂起待人工核实`);
-        writeStatus({ status: "blocked", current_task: `疑假完成·${blocked} 任务阻塞`, remaining: 0, completed: total, cost_usd: totalCost });
-        await sleep(300_000);
-        continue;
+      const blocked = countBlocked();
+      // 防假完成守卫：有阻塞标记或全程零 commit → suspected_false_completion（不设 last_termination，待人工介入）
+      if (blocked > 0 || !state.had_any_commit) {
+        log(`⚠️ remaining=0 但 ${blocked > 0 ? `${blocked} 个 [~] 阻塞` : "全程零 commit"}：疑假完成，挂起待人工核实（不设 last_termination）`);
+        appendEvent("suspected_false_completion", { blocked, had_any_commit: state.had_any_commit, total }, { tick_id: tickId, loop_count: state.loop_count });
+        state.status = "blocked_suspect";
+        state.last_tick_at = now();
+        state.last_tick_id = tickId;
+        writeStateJsonAtomic(state);
+        writeStatus({ status: "blocked_suspect", current_task: `疑假完成·${blocked > 0 ? `${blocked} 阻塞` : "零commit"}`, remaining: 0, completed: total, cost_usd: state.total_cost_usd });
+        appendEvent("tick_completed", { outcome: "terminated" }, { tick_id: tickId, loop_count: state.loop_count });
+        return { kind: "terminated" };
       }
-      if (!hadAnyCommit) {
-        log("⚠️ remaining=0 但全程零 commit：疑假完成，挂起待人工核实");
-        writeStatus({ status: "blocked", current_task: "疑假完成·全程零commit", remaining: 0, completed: total, cost_usd: totalCost });
-        await sleep(300_000);
-        continue;
-      }
-      log(`✅ 全部完成！共 ${total} 个任务，总花费 $${totalCost.toFixed(4)}`);
-      writeStatus({ status: "completed", current_task: "全部完成", remaining: 0, completed: total, cost_usd: totalCost });
-      rmSync(PID_FILE, { force: true });
-      return;
+      log(`✅ 全部完成！共 ${total} 个任务，总花费 $${state.total_cost_usd.toFixed(4)}`);
+      appendEvent("done", { total, total_cost_usd: state.total_cost_usd }, { tick_id: tickId, loop_count: state.loop_count });
+      state.last_termination = { reason: "done", ts: now() };
+      state.status = "completed";
+      state.last_tick_at = now();
+      state.last_tick_id = tickId;
+      writeStateJsonAtomic(state);
+      writeStatus({ status: "completed", current_task: "全部完成", remaining: 0, completed: total, cost_usd: state.total_cost_usd });
+      appendEvent("tick_completed", { outcome: "terminated" }, { tick_id: tickId, loop_count: state.loop_count });
+      return { kind: "terminated" };
     }
 
-    if (totalCost >= MAX_BUDGET_TOTAL) {
+    if (!taskLine) {
+      // remaining>0 但没有未完成任务行（数据不一致）—— 不推进，等人工修
+      log("⚠️ remaining>0 但找不到未完成任务行，.task.md 数据不一致");
+      appendEvent("tick_skipped", { reason: "task_line_missing_with_remaining", remaining }, { tick_id: tickId, loop_count: state.loop_count });
+      return { kind: "stalled" };
+    }
+
+    // 步骤7: 终止判定 B: total_cost >= MAX_BUDGET_TOTAL
+    if (state.total_cost_usd >= MAX_BUDGET_TOTAL) {
       log(`🛑 达到全程预算上限 $${MAX_BUDGET_TOTAL}，停止`);
-      writeStatus({ status: "budget_exceeded", current_task: "预算耗尽", remaining, completed: total - remaining, cost_usd: totalCost });
-      rmSync(PID_FILE, { force: true });
-      return;
+      appendEvent("budget_exceeded", { total_cost_usd: state.total_cost_usd, limit: MAX_BUDGET_TOTAL }, { tick_id: tickId, loop_count: state.loop_count });
+      state.last_termination = { reason: "budget_exceeded", ts: now() };
+      state.status = "budget_exceeded";
+      state.last_tick_at = now();
+      state.last_tick_id = tickId;
+      writeStateJsonAtomic(state);
+      writeStatus({ status: "budget_exceeded", current_task: "预算耗尽", remaining, completed: total - remaining, cost_usd: state.total_cost_usd });
+      appendEvent("tick_completed", { outcome: "terminated" }, { tick_id: tickId, loop_count: state.loop_count });
+      return { kind: "terminated" };
     }
 
-    const taskLine = currentTaskLine()!;
-    loopCount++;
-    log("━".repeat(60));
-    log(`🔄 第 ${loopCount} 轮 | 剩余 ${remaining}/${total}`);
-    log(`📋 ${taskLine}`);
-    writeStatus({ status: "running", current_task: taskLine, remaining, completed: total - remaining, cost_usd: totalCost });
-
-    const { result, wroteFiles, toolCalls, aborted } = await runOneTask(taskLine, sessionId, totalCost);
-
-    // 完成判定看真实结构化信号，不是 git diff 猜测
-    const didRealWork = wroteFiles.length > 0;
+    // 步骤8: 陷阱5 stallTask 跨 tick reset
+    // （.task.md 可能被人工改后 stallTask 失效，currentTaskKey 变了就 reset）
     const taskKey = taskLine.slice(0, 120);
+    if (state.stall_task !== taskKey) {
+      state.stall_task = null;
+      state.stall_count = 0;
+    }
 
+    // 步骤9: loop_count++，status=running，pre-run 写盘（让 --status 看到正在跑）
+    state.loop_count++;
+    state.status = "running";
+    state.last_tick_at = now();
+    state.last_tick_id = tickId;
+    writeStateJsonAtomic(state);
+    writeStatus({ status: "running", current_task: taskLine, remaining, completed: total - remaining, cost_usd: state.total_cost_usd });
+    log("━".repeat(60));
+    log(`🔄 第 ${state.loop_count} 轮 | 剩余 ${remaining}/${total} | tick_id=${tickId}`);
+    log(`📋 ${taskLine}`);
+
+    // 步骤10: 读 .session_id，session_resumed 事件
+    let sessionId = readSessionId();
+    if (sessionId) {
+      appendEvent("session_resumed", { session_id: sessionId }, { tick_id: tickId, loop_count: state.loop_count });
+    }
+
+    // 步骤11: runOneTask（核心不变：query + PostToolUse hook + 看门狗）
+    const { result, wroteFiles, toolCalls, aborted } = await runOneTask(taskLine, sessionId, state.total_cost_usd);
+
+    // ★步骤12 阶段A: total_cost_usd += roundCost 并原子写 state.json
+    // （财务数据不可丢，在 tickFirst/commit 之前落盘——崩溃恢复时 cost 仍正确）
+    const tickCost = result?.total_cost_usd ?? 0;
+    state.total_cost_usd = roundCost(state.total_cost_usd + tickCost);
+    writeStateJsonAtomic(state);
+    appendEvent("cost_accrued", { tick_cost: roundCost(tickCost), total_cost_usd: state.total_cost_usd }, { tick_id: tickId, loop_count: state.loop_count });
+
+    // 步骤13: session_id 更新（新会话 → session_created）
     if (result?.session_id && result.session_id !== sessionId) {
       sessionId = result.session_id;
-      writeFileSync(SESSION_FILE, sessionId);
-      if (loopCount === 1) log(`🔗 新会话已建立: ${sessionId}`);
+      writeSessionId(sessionId);
+      if (state.loop_count === 1) {
+        log(`🔗 新会话已建立: ${sessionId}`);
+      }
+      appendEvent("session_created", { session_id: sessionId }, { tick_id: tickId, loop_count: state.loop_count });
     }
 
     if (result) {
-      totalCost += result.total_cost_usd ?? 0;
       if (result.subtype !== "success") {
         log(`⚠️ 本轮非 success: subtype=${result.subtype} stop_reason=${result.stop_reason}`);
       }
     }
 
-    // 撞上下文撑爆/超时：弃会话下轮开新会话重试同任务，不标阻塞
-    if (aborted || (result && /context length|exceeds/i.test(JSON.stringify(result)))) {
-      log("🧠 疑上下文撑爆/超时，弃会话下轮开新会话重试同任务");
-      rmSync(SESSION_FILE, { force: true });
-      sessionId = null;
-      stallTask = null; stallCount = 0;
-      writeStatus({ status: "ctx-overflow-retry", current_task: taskLine, remaining, completed: total - remaining, cost_usd: totalCost });
-      await sleep(5_000);
-      continue;
+    // 步骤14: 陷阱6 ctx-overflow 改结构化判定（subtype + errors/stop_reason，不再 stringify+正则）
+    const isCtxOverflow =
+      result?.subtype === "error_during_execution" &&
+      (result.errors?.some((e) => /context|exceed|too long/i.test(e))
+        || /context/i.test(result.stop_reason ?? ""));
+    const isTaskBudgetExhausted = result?.subtype === "error_max_budget_usd";
+
+    if (aborted || isCtxOverflow) {
+      // 陷阱7: session_retries 防 ctx-overflow 死循环（连续 N 次弃会话标阻塞）
+      state.session_retries++;
+      const reason = aborted ? "aborted" : "ctx_overflow";
+      log(`🧠 撞上下文撑爆/超时（${reason}），弃会话下轮开新会话重试同任务（session_retries=${state.session_retries}/${SESSION_RETRY_LIMIT}）`);
+      clearSessionId();
+      appendEvent("session_dropped", { reason, session_retries: state.session_retries, limit: SESSION_RETRY_LIMIT }, { tick_id: tickId, loop_count: state.loop_count });
+      if (aborted) appendEvent("aborted", { task: taskKey }, { tick_id: tickId, loop_count: state.loop_count });
+      // 不打勾，不标阻塞（除非连续 N 次）
+      if (state.session_retries >= SESSION_RETRY_LIMIT) {
+        log(`🚧 连续 ${SESSION_RETRY_LIMIT} 次 session_dropped，标 [~] 阻塞跳过，推进下一任务`);
+        blockFirst();
+        appendEvent("task_blocked", { task: taskKey, reason: "session_retry_limit" }, { tick_id: tickId, loop_count: state.loop_count });
+        state.session_retries = 0;
+        state.stall_task = null;
+        state.stall_count = 0;
+      }
+      state.status = "ctx_overflow_retry";
+      const { remaining: newRem } = readTasks();
+      writeStatus({ status: "ctx-overflow-retry", current_task: taskLine, remaining: newRem, completed: total - newRem, cost_usd: state.total_cost_usd });
+      appendEvent("tick_completed", { outcome: "session_dropped" }, { tick_id: tickId, loop_count: state.loop_count });
+      return { kind: "session_dropped" };
     }
 
+    if (isTaskBudgetExhausted) {
+      // 单任务预算耗尽 ≠ ctx overflow，标阻塞但不弃会话
+      log(`💸 单任务预算耗尽（error_max_budget_usd），标 [~] 阻塞跳过（保留会话）`);
+      blockFirst();
+      appendEvent("task_blocked", { task: taskKey, reason: "task_budget_exhausted" }, { tick_id: tickId, loop_count: state.loop_count });
+      state.session_retries = 0;
+      state.stall_task = null;
+      state.stall_count = 0;
+      state.status = "idle";
+      state.last_tick_at = now();
+      writeStateJsonAtomic(state);
+      const { remaining: newRem } = readTasks();
+      writeStatus({ status: "idle", current_task: taskLine, remaining: newRem, completed: total - newRem, cost_usd: state.total_cost_usd });
+      appendEvent("tick_completed", { outcome: "blocked" }, { tick_id: tickId, loop_count: state.loop_count });
+      return { kind: "blocked" };
+    }
+
+    // 步骤15: didRealWork 判定（看 PostToolUse hook 捕获的真实写入，不是 git diff 猜测）
+    const didRealWork = wroteFiles.length > 0;
     if (didRealWork) {
       tickFirst();
       const committed = gitCommitIfChanged(taskLine);
-      if (committed) hadAnyCommit = true;
-      log(`⏱️ 第 ${loopCount} 轮结束：写入 ${wroteFiles.length} 文件 / ${toolCalls} 工具调用 / $${(result?.total_cost_usd ?? 0).toFixed(4)}（${committed ? "已提交" : "无暂存"}）`);
-      stallTask = null; stallCount = 0;
+      if (committed) state.had_any_commit = true;
+      log(`⏱️ 第 ${state.loop_count} 轮结束：写入 ${wroteFiles.length} 文件 / ${toolCalls} 工具调用 / $${tickCost.toFixed(4)}（${committed ? "已提交" : "无暂存"}）`);
+      state.stall_task = null;
+      state.stall_count = 0;
+      state.session_retries = 0;
+      appendEvent("task_completed", { task: taskKey, wrote_files: wroteFiles, committed }, { tick_id: tickId, loop_count: state.loop_count });
     } else {
       // 零改动：worker 判了"已完成"但没写代码 → 记空转，不打勾
-      stallTask = taskKey; stallCount++;
-      log(`⏸️ 零改动空转 #${stallCount}: ${taskKey}`);
-      if (stallCount >= STALL_LIMIT) {
+      state.stall_task = taskKey;
+      state.stall_count++;
+      log(`⏸️ 零改动空转 #${state.stall_count}: ${taskKey}`);
+      appendEvent("task_stall", { task: taskKey, stall_count: state.stall_count, limit: STALL_LIMIT }, { tick_id: tickId, loop_count: state.loop_count });
+      if (state.stall_count >= STALL_LIMIT) {
         blockFirst();
         log(`🚧 连续 ${STALL_LIMIT} 次空转，标 [~] 阻塞跳过，推进下一任务`);
-        stallTask = null; stallCount = 0;
+        appendEvent("task_blocked", { task: taskKey, reason: "stall_limit" }, { tick_id: tickId, loop_count: state.loop_count });
+        state.stall_task = null;
+        state.stall_count = 0;
       }
     }
 
+    // 步骤16: 写 state.json + 派生 .status 快照 + tick_completed
+    state.status = "idle";
+    state.last_tick_at = now();
+    writeStateJsonAtomic(state);
     const { remaining: newRem } = readTasks();
-    writeStatus({ status: "idle", current_task: taskLine, remaining: newRem, completed: total - newRem, cost_usd: totalCost });
+    writeStatus({ status: "idle", current_task: taskLine, remaining: newRem, completed: total - newRem, cost_usd: state.total_cost_usd });
 
-    await sleep(5_000);
+    const outcome: TickOutcome["kind"] = didRealWork ? "advanced" : (state.stall_count > 0 ? "stalled" : "blocked");
+    appendEvent("tick_completed", { outcome }, { tick_id: tickId, loop_count: state.loop_count });
+    return didRealWork ? { kind: "advanced" } : (state.stall_count > 0 ? { kind: "stalled" } : { kind: "blocked" });
+  } finally {
+    // 步骤16 续: 释放 flock（finally 保证异常/崩溃也释放）
+    releaseLock();
   }
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// ---------------- watch()：自驱循环 ----------------
 
-// ---------------- 首次任务拆解 ----------------
+// 自驱场景：bootstrap + while(tick())，保留长进程语义给命令行直跑。
+// 终止类 outcome（done/budget_exceeded/already_terminated/stopped）break；
+// already_running 退避 30s；其余退避 5s。
+async function watch(goal: string) {
+  writeFileSync(PID_FILE, String(process.pid));
+  try {
+    log(`orchestrator --watch 启动，PID=${process.pid}`);
+
+    if (!existsSync(TASK_FILE)) {
+      await bootstrapTasks(goal);
+    }
+    // 记录 goal 到 state.json（如果 state 为空/首次）
+    if (!existsSync(STATE_FILE)) {
+      writeStateJsonAtomic({ ...DEFAULT_STATE, goal });
+    } else {
+      const s = readStateJson();
+      if (!s.goal) { s.goal = goal; writeStateJsonAtomic(s); }
+    }
+    appendEvent("bootstrap_completed", { goal }, { tick_id: null, loop_count: 0 });
+
+    while (true) {
+      const o = await tick();
+      if (["done", "budget_exceeded", "already_terminated", "stopped"].includes(o.kind)) break;
+      if (o.kind === "already_running") {
+        await sleep(ALREADY_RUNNING_SLEEP_MS);
+        continue;
+      }
+      // advanced / stalled / blocked / session_dropped
+      await sleep(WATCH_SLEEP_MS);
+    }
+    log("orchestrator --watch 退出");
+  } finally {
+    rmSync(PID_FILE, { force: true });
+  }
+}
+
+// ---------------- 首次任务拆解（保留不变）----------------
 
 async function bootstrapTasks(goal: string) {
   log("首次运行，拆解任务...");
@@ -422,28 +774,52 @@ async function bootstrapTasks(goal: string) {
   log(`✅ 共 ${taskLines.length} 个任务`);
 }
 
-// ---------------- 状态 / 报告 ----------------
+// ---------------- 状态 / 报告（改读 state.json + events.jsonl）----------------
+
+// 读 .pid 探活：看 --watch 是否在跑
+function watchRunning(): { running: boolean; pid: number | null } {
+  if (!existsSync(PID_FILE)) return { running: false, pid: null };
+  const pid = Number(readFileSync(PID_FILE, "utf8"));
+  if (isNaN(pid)) return { running: false, pid: null };
+  try { process.kill(pid, 0); return { running: true, pid }; }
+  catch { return { running: false, pid }; }
+}
 
 function showStatus() {
-  const st = readStatus();
-  if (st) {
-    console.log(`last_heartbeat: ${st.last_heartbeat}`);
-    console.log(`status: ${st.status}`);
-    console.log(`current_task: ${st.current_task}`);
-    console.log(`remaining: ${st.remaining}`);
-    console.log(`completed: ${st.completed}`);
-    console.log(`cost_usd: ${st.cost_usd}`);
+  // 优先读 state.json
+  const s = readStateJson();
+  const { total, remaining } = readTasks();
+  console.log("━".repeat(60));
+  console.log("📊 orchestrator 状态");
+  console.log("━".repeat(60));
+  console.log(`status: ${s.status}`);
+  console.log(`goal: ${s.goal || "(未设置)"}`);
+  console.log(`loop_count: ${s.loop_count}`);
+  console.log(`total_cost_usd: ${s.total_cost_usd.toFixed(4)} / ${MAX_BUDGET_TOTAL}`);
+  console.log(`remaining: ${remaining} / ${total}`);
+  console.log(`completed: ${total - remaining}`);
+  console.log(`had_any_commit: ${s.had_any_commit}`);
+  console.log(`stall_task: ${s.stall_task ?? "(无)"}`);
+  console.log(`stall_count: ${s.stall_count} / ${STALL_LIMIT}`);
+  console.log(`session_retries: ${s.session_retries} / ${SESSION_RETRY_LIMIT}`);
+  console.log(`last_tick_at: ${s.last_tick_at ?? "(无)"}`);
+  console.log(`last_tick_id: ${s.last_tick_id ?? "(无)"}`);
+  console.log(`last_termination: ${s.last_termination ? `${s.last_termination.reason} @ ${s.last_termination.ts}` : "(无)"}`);
+  const wr = watchRunning();
+  console.log(`\n--watch 进程: ${wr.running ? `运行中 PID=${wr.pid}` : "未运行"}`);
+  const sid = readSessionId();
+  console.log(`session_id: ${sid ?? "(无，下轮开新会话)"}`);
+
+  console.log("\n--- events.jsonl 末尾 8 条 ---");
+  const evs = readEventsTail(8);
+  if (evs.length === 0) {
+    console.log("(无事件)");
   } else {
-    console.log("暂无状态文件");
-  }
-  console.log("");
-  console.log("进程状态：");
-  if (existsSync(PID_FILE)) {
-    const pid = Number(readFileSync(PID_FILE, "utf8"));
-    try { process.kill(pid, 0); console.log(`  主进程: 运行中 PID=${pid}`); }
-    catch { console.log(`  主进程: 未运行 (PID 文件残留 ${pid})`); }
-  } else {
-    console.log("  主进程: 未运行");
+    for (const e of evs) {
+      const lc = e.loop_count !== null ? `#${e.loop_count}` : "";
+      const tid = e.tick_id ? `[${e.tick_id}]` : "";
+      console.log(`[${e.ts}] ${e.type} ${lc}${tid} ${JSON.stringify(e.data)}`);
+    }
   }
 }
 
@@ -451,52 +827,105 @@ function showReport() {
   console.log("━".repeat(60));
   console.log("📊 无人值守运行报告");
   console.log("━".repeat(60));
-  if (existsSync(TASK_FILE)) {
-    const { total, remaining } = readTasks();
-    const done = total - remaining;
-    console.log(`任务进度: ${done} / ${total} 已完成`);
-  }
-  const st = readStatus();
-  if (st) { console.log("\n最后状态:"); for (const [k, v] of Object.entries(st)) console.log(`  ${k}: ${v}`); }
+  const s = readStateJson();
+  const { total, remaining } = readTasks();
+  console.log(`任务进度: ${total - remaining} / ${total} 已完成`);
+  console.log(`loop_count: ${s.loop_count}`);
+  console.log(`total_cost_usd: $${s.total_cost_usd.toFixed(4)} / $${MAX_BUDGET_TOTAL}`);
+  console.log(`status: ${s.status}`);
+  if (s.last_termination) console.log(`终止: ${s.last_termination.reason} @ ${s.last_termination.ts}`);
+
+  // 从 events.jsonl 统计
+  console.log("\n--- 事件统计（events.jsonl）---");
+  console.log(`  task_completed: ${countEvents("task_completed")}`);
+  console.log(`  task_blocked: ${countEvents("task_blocked")}`);
+  console.log(`  task_stall: ${countEvents("task_stall")}`);
+  console.log(`  session_dropped: ${countEvents("session_dropped")}`);
+  console.log(`  aborted: ${countEvents("aborted")}`);
+
+  const wr = watchRunning();
+  console.log(`\n--watch 进程: ${wr.running ? `运行中 PID=${wr.pid}` : "未运行"}`);
+
+  // night_run.log 兜底 grep（保留历史异常排查能力）
   if (existsSync(LOG_FILE)) {
     const logText = readFileSync(LOG_FILE, "utf8");
-    console.log("\n异常/报错：");
-    const errs = logText.split("\n").filter((l) => /错误|失败|❌|异常|假死|空转|阻塞/.test(l)).slice(-20);
+    console.log("\n--- night_run.log 异常尾 20 条 ---");
+    const errs = logText.split("\n").filter((l) => /错误|失败|❌|异常|假死|空转|阻塞|stale|crash|崩溃/.test(l)).slice(-20);
     console.log(errs.length ? errs.join("\n") : "（未发现）");
   }
 }
 
+// 陷阱3: --stop 改为写 .stop 哨兵 + 杀 --watch PID（如有且活着）
 function stopAll() {
-  log("收到停止指令");
+  log("收到 --stop 指令，写 .stop 哨兵");
+  writeFileSync(STOP_FILE, `${now()} PID=${process.pid}\n`);
+  // 杀 --watch PID（如果存在且活着）—— tick 是短进程，杀了 cron 5m 后又来，所以靠哨兵而非杀进程
   if (existsSync(PID_FILE)) {
     const pid = Number(readFileSync(PID_FILE, "utf8"));
-    try {
-      process.kill(pid, "SIGTERM");
-      console.log(`主进程已停止 (PID=${pid})`);
-    } catch { console.log("主进程未运行"); }
-    rmSync(PID_FILE, { force: true });
+    if (!isNaN(pid)) {
+      try {
+        process.kill(pid, "SIGTERM");
+        console.log(`已发送 SIGTERM 给 --watch 进程 PID=${pid}`);
+      } catch {
+        console.log(`--watch 进程 PID=${pid} 未运行（PID 文件残留）`);
+      }
+      rmSync(PID_FILE, { force: true });
+    }
   } else {
-    console.log("主进程未运行");
+    console.log("无 --watch 进程在跑（仅写 .stop 哨兵，阻止后续 tick）");
+  }
+  console.log("已写 .stop 哨兵。下次 tick 会跳过。用 --resume 清除哨兵恢复。");
+}
+
+// --resume：删 .stop 哨兵
+function resumeRun() {
+  if (existsSync(STOP_FILE)) {
+    rmSync(STOP_FILE, { force: true });
+    console.log("已删除 .stop 哨兵，恢复 tick/watch");
+  } else {
+    console.log("无 .stop 哨兵，无需恢复");
   }
 }
 
 // ---------------- 入口 ----------------
 
-// 解析命令行：--cwd <dir> 可放任意位置，第一个非选项参数为目标
+// 解析命令行（用 node:util parseArgs，零依赖 Node 18+）：
+// --cwd <dir> 可放任意位置；--tick/--watch/--status/--report/--stop/--resume 控制 action；goal 为位置参数。
 function parseArgs(argv: string[]): {
-  goal?: string; cwd?: string; action?: "status" | "report" | "stop";
+  goal?: string; cwd?: string;
+  action?: "status" | "report" | "stop" | "resume" | "tick" | "watch";
 } {
-  let goal: string | undefined;
-  let cwd: string | undefined;
-  let action: "status" | "report" | "stop" | undefined;
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "--cwd") { cwd = argv[++i]; continue; }
-    if (a === "--status") { action = "status"; continue; }
-    if (a === "--report") { action = "report"; continue; }
-    if (a === "--stop") { action = "stop"; continue; }
-    if (!goal && !a.startsWith("--")) { goal = a; continue; }
+  let parsed: { values: Record<string, string | boolean | undefined>; positionals: string[] };
+  try {
+    // parseArgs 第二参数是 args；node:util 的 parseArgs(config?: T) 只接一个 config 对象，args 放 config.args
+    parsed = nodeParseArgs({
+      args: argv,
+      allowPositionals: true,
+      options: {
+        cwd: { type: "string" },
+        tick: { type: "boolean", default: false },
+        watch: { type: "boolean", default: false },
+        status: { type: "boolean", default: false },
+        report: { type: "boolean", default: false },
+        stop: { type: "boolean", default: false },
+        resume: { type: "boolean", default: false },
+      },
+    });
+  } catch (e) {
+    console.error(`参数解析失败: ${(e as Error).message}`);
+    process.exit(2);
   }
+  const { values, positionals } = parsed;
+  const cwd = typeof values.cwd === "string" ? values.cwd : undefined;
+  const goal = positionals.length > 0 ? positionals[0] : undefined;
+  // action 优先级：显式 flag（先到先得，互斥）
+  let action: "status" | "report" | "stop" | "resume" | "tick" | "watch" | undefined;
+  if (values.tick) action = "tick";
+  else if (values.watch) action = "watch";
+  else if (values.status) action = "status";
+  else if (values.report) action = "report";
+  else if (values.stop) action = "stop";
+  else if (values.resume) action = "resume";
   return { goal, cwd, action };
 }
 
@@ -512,22 +941,44 @@ async function main() {
   }
   process.chdir(targetCwd);
 
+  mkdirSync(MEMO_DIR, { recursive: true });
+
   if (action === "status") { showStatus(); return; }
   if (action === "report") { showReport(); return; }
   if (action === "stop") { stopAll(); return; }
+  if (action === "resume") { resumeRun(); return; }
 
-  if (!existsSync(TASK_FILE)) {
-    if (!goal) {
-      console.error('首次运行需要指定目标，例如：\n  npx tsx orchestrator.ts --cwd /path/to/project "构建一个Go REST API"');
+  if (action === "tick") {
+    // 单步：幂等、可恢复，任意调度器可调用
+    const o = await tick();
+    log(`tick 结果: ${o.kind}`);
+    // tick 退出码（方便调度器判断）：所有非 already_running 的状态都正常退出
+    // （terminated/stopped/already_terminated 视为完成态；already_running 静默退出不算错误）
+    process.exit(0);
+  }
+
+  // --watch 或裸跑（向后兼容）
+  if (action === "watch" || !action) {
+    // 裸跑且无 goal 且 .task.md 存在 → 续跑（--watch 语义）
+    // 裸跑且无 goal 且 .task.md 不存在 → 报错
+    if (!goal && !existsSync(TASK_FILE)) {
+      console.error('首次运行需要指定目标，例如：\n  npx tsx orchestrator.ts --cwd /path/to/project --watch "构建一个Go REST API"');
       process.exit(1);
     }
-    await bootstrapTasks(goal);
+    // 从 state.json 恢复 goal（如果 goal 没给但 state 里有）
+    const effectiveGoal = goal ?? (existsSync(STATE_FILE) ? readStateJson().goal : "");
+    if (!effectiveGoal) {
+      console.error('无法确定目标：无 goal 参数且 state.json 无 goal');
+      process.exit(1);
+    }
+    await watch(effectiveGoal);
+    return;
   }
-  await mainLoop();
 }
 
 main().catch((e) => {
   log(`💥 orchestrator 崩溃: ${e?.stack || e}`);
   rmSync(PID_FILE, { force: true });
+  releaseLock();
   process.exit(1);
 });
