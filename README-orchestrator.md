@@ -7,19 +7,24 @@
 ## 用法
 
 ```bash
-# 1. 装依赖（一次）
+# 1. 装依赖（一次，在 loop 仓库）
 npm install
 
-# 2. 在目标项目目录里启动（产物写在当前目录）
-npx tsx /path/to/orchestrator.ts "构建一个 Go REST API"
+# 2. 用 --cwd 指定目标项目目录启动（产物写入该目录）
+npx tsx /path/to/orchestrator.ts --cwd /path/to/project "构建一个 Go REST API"
 
-# 实时状态 / 报告 / 停止
-npx tsx orchestrator.ts --status
-npx tsx orchestrator.ts --report
-npx tsx orchestrator.ts --stop
+# 实时状态 / 报告 / 停止（同样可带 --cwd）
+npx tsx orchestrator.ts --cwd /path/to/project --status
+npx tsx orchestrator.ts --cwd /path/to/project --report
+npx tsx orchestrator.ts --cwd /path/to/project --stop
 ```
 
-> ⚠️ **在目标项目目录里跑**，别在 loop 仓库根目录跑——脚本会往当前目录写 `.task.md`/`.status`/`night_run.log`/`.pid`/`.session_id` 并 `git commit` 当前目录的 git 仓库。
+`--cwd` 决定三件事，三者统一指向它，避免错位：
+1. 产物写入处（`.task.md`/`.status`/`night_run.log`/`.pid`/`.session_id`）
+2. `git commit` 作用的仓库
+3. 会话工作目录（query 的 cwd 默认即 `process.cwd()`）
+
+不传 `--cwd` 则回退到当前目录（兼容旧行为）。**别在 loop 仓库根目录裸跑**——那会把产物写进 loop 仓库并 commit 它。
 
 ## 核心机制
 

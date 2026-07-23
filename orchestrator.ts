@@ -1,17 +1,20 @@
 // orchestrator.ts —— SDK 版 24h 无人值守开发 orchestrator
 //
 // 用法：
-//   npx tsx orchestrator.ts "目标"      # 启动（拆任务 + 主循环）
-//   npx tsx orchestrator.ts --status    # 看实时状态
-//   npx tsx orchestrator.ts --stop      # 停止
-//   npx tsx orchestrator.ts --report     # 报告
+//   npx tsx orchestrator.ts [--cwd <项目目录>] "目标"   # 启动（拆任务 + 主循环）
+//   npx tsx orchestrator.ts [--cwd <项目目录>] --status  # 看实时状态
+//   npx tsx orchestrator.ts [--cwd <项目目录>] --stop    # 停止
+//   npx tsx orchestrator.ts [--cwd <项目目录>] --report  # 报告
+//
+// --cwd 指定目标项目目录（产物写入处 + git commit 的仓库 + 会话工作目录）；不传则用当前目录。
 //
 // 会话策略：首轮新会话（query 返回的 session_id 落盘），后续轮 resume 同一会话；
 // 永不使用 continue（避免旧会话污染）。
 
 import { query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 
 // ---------------- 配置 ----------------
 
@@ -479,19 +482,46 @@ function stopAll() {
 
 // ---------------- 入口 ----------------
 
-async function main() {
-  const arg = process.argv[2] ?? "";
+// 解析命令行：--cwd <dir> 可放任意位置，第一个非选项参数为目标
+function parseArgs(argv: string[]): {
+  goal?: string; cwd?: string; action?: "status" | "report" | "stop";
+} {
+  let goal: string | undefined;
+  let cwd: string | undefined;
+  let action: "status" | "report" | "stop" | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--cwd") { cwd = argv[++i]; continue; }
+    if (a === "--status") { action = "status"; continue; }
+    if (a === "--report") { action = "report"; continue; }
+    if (a === "--stop") { action = "stop"; continue; }
+    if (!goal && !a.startsWith("--")) { goal = a; continue; }
+  }
+  return { goal, cwd, action };
+}
 
-  if (arg === "--status") { showStatus(); return; }
-  if (arg === "--report") { showReport(); return; }
-  if (arg === "--stop") { stopAll(); return; }
+async function main() {
+  const { goal, cwd, action } = parseArgs(process.argv.slice(2));
+
+  // 目标目录：--cwd 显式指定 > 当前目录。chdir 后所有相对路径产物、git 仓库、
+  // 会话工作目录三者统一指向它（query 的 cwd 默认即 process.cwd()）。
+  const targetCwd = cwd ? resolve(cwd) : process.cwd();
+  if (!existsSync(targetCwd) || !statSync(targetCwd).isDirectory()) {
+    console.error(`目标目录不存在或非目录: ${targetCwd}`);
+    process.exit(1);
+  }
+  process.chdir(targetCwd);
+
+  if (action === "status") { showStatus(); return; }
+  if (action === "report") { showReport(); return; }
+  if (action === "stop") { stopAll(); return; }
 
   if (!existsSync(TASK_FILE)) {
-    if (!arg) {
-      console.error('首次运行需要指定目标，例如：\n  npx tsx orchestrator.ts "构建一个Go REST API"');
+    if (!goal) {
+      console.error('首次运行需要指定目标，例如：\n  npx tsx orchestrator.ts --cwd /path/to/project "构建一个Go REST API"');
       process.exit(1);
     }
-    await bootstrapTasks(arg);
+    await bootstrapTasks(goal);
   }
   await mainLoop();
 }
