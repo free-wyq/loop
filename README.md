@@ -16,7 +16,13 @@ curl -fsSL https://raw.githubusercontent.com/free-wyq/loop/main/install.sh | bas
 
 ### 方式二 · `.md`：给智能体读（它读完自行装）
 
-把 [install.md](install.md) 发给你的 AI 助手——它读懂后按文档执行上面的 bash 即可装好。适合让 agent 自主配置、或不想手动敲命令的场景。
+把这个地址发给你的 AI 助手：
+
+```
+https://raw.githubusercontent.com/free-wyq/loop/main/install.md
+```
+
+让它读这个文档、按文档执行上面的 bash 即可装好。适合让 agent 自主配置、或不想手动敲命令的场景。
 
 ---
 
