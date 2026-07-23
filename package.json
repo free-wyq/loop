@@ -3,9 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "SDK 版 24h 无人值守开发 orchestrator（替代 unattended.sh）",
+  "description": "24h 无人值守开发 orchestrator（claude-agent-sdk）",
   "scripts": {
-    "smoke": "tsx smoke.ts",
     "run": "tsx orchestrator.ts",
     "status": "tsx orchestrator.ts --status",
     "stop": "tsx orchestrator.ts --stop",

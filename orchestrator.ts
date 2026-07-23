@@ -1,22 +1,17 @@
 // orchestrator.ts —— SDK 版 24h 无人值守开发 orchestrator
 //
-// 这是 unattended.sh 的重写：把"bash 站在 claude 外面靠 git diff 猜状态"
-// 换成"进程内用 SDK query() 拿结构化事件 + PostToolUse hook 实时看真实改动"。
-//
 // 用法：
 //   npx tsx orchestrator.ts "目标"      # 启动（拆任务 + 主循环）
 //   npx tsx orchestrator.ts --status    # 看实时状态
 //   npx tsx orchestrator.ts --stop      # 停止
 //   npx tsx orchestrator.ts --report     # 报告
 //
-// 设计与 unattended.sh 的对应关系见文件末尾"对照表"。
-// 会话策略与原脚本一致：首轮新会话（query 返回的 session_id 落盘），
-// 后续轮 resume 同一会话；永不使用 continue（避免旧会话污染）。
+// 会话策略：首轮新会话（query 返回的 session_id 落盘），后续轮 resume 同一会话；
+// 永不使用 continue（避免旧会话污染）。
 
 import { query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, statSync, rmSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmSync } from "node:fs";
 
 // ---------------- 配置 ----------------
 
@@ -68,7 +63,7 @@ function readStatus(): Partial<Status> | null {
   return obj as unknown as Partial<Status>;
 }
 
-// ---- 任务文件读写（保留 .task.md 兼容 unattended.sh 的格式）----
+// ---- 任务文件读写（.task.md 格式）----
 
 interface Tasks { total: number; remaining: number; }
 
@@ -120,29 +115,24 @@ function blockFirst() {
   }
 }
 
-// ---------------- git 提交（保留原脚本的 commit 逻辑）----------------
+// ---------------- git 提交 ----------------
 
 function git(args: string[]): { stdout: string; status: number } {
-  // 注意：execFileSync 失败（退出码非 0）时抛异常，必须用 try/catch 捕获 status。
-  // 这正是 JS 版不能照搬 bash「靠 $? 判暂存」的原因——
+  // execFileSync 失败（退出码非 0）时抛异常，必须 try/catch 捕 status：
   // git diff --cached --quiet 退出码 1（有暂存改动）会抛异常，退出码 0（无改动）返回空串。
   try {
     const stdout = execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     return { stdout, status: 0 };
   } catch (e) {
-    const status = (e as { status?: number }).status ?? 1;
-    const stdout = (e as { stdout?: string }).stdout ?? "";
-    return { stdout, status };
+    return { stdout: (e as { stdout?: string }).stdout ?? "", status: (e as { status?: number }).status ?? 1 };
   }
 }
 
 function gitCommitIfChanged(taskLine: string): boolean {
   if (!existsSync(".git")) return false;
   git(["add", "-A"]);
-  // 退出码 0 = 无暂存改动；非 0 = 有暂存改动（--quiet 的语义）
-  const { status } = git(["diff", "--cached", "--quiet"]);
+  const { status } = git(["diff", "--cached", "--quiet"]);  // 0=无暂存；非0=有暂存
   if (status === 0) return false;
-  // 解析 commit message：[XX-NN] tag 作 scope，否则 feat: desc
   const tagMatch = taskLine.match(/\[([A-Z]+-[0-9]+)\]/);
   const desc = taskLine.replace(/^- \[[ x~]\] /, "").replace(/\[[A-Z]*-[0-9]*\]\s*/g, "").slice(0, 200);
   const msg = tagMatch ? `feat(${tagMatch[1]}): ${desc}` : `feat: ${desc}`;
@@ -153,13 +143,13 @@ function gitCommitIfChanged(taskLine: string): boolean {
 // ---------------- 核心：单任务一轮 query ----------------
 
 interface RoundOutcome {
-  result: Extract<SDKResultMessage, { subtype: "success" }> | Extract<SDKResultMessage, { subtype: string }> | null;
+  result: SDKResultMessage | null;
   wroteFiles: string[];    // PostToolUse hook 捕获的文件写入
   toolCalls: number;       // 总工具调用数
   aborted: boolean;
 }
 
-// 铁律 prompt：从 unattended.sh 移植，禁提问 + 自主决策 + 已完成检测
+// 铁律 prompt：禁提问 + 自主决策 + 已完成检测（防假完成）
 function buildPrompt(taskLine: string): string {
   return `## 角色
 你是无人值守开发助手，当前处于 24 小时自动运行模式。全程没有任何人在场，你必须独立完成决策。
@@ -220,15 +210,13 @@ async function runOneTask(taskLine: string, sessionId: string | null, costSoFar:
     maxTurns: MAX_TURNS_PER_TASK,
     maxBudgetUsd: Math.min(MAX_BUDGET_PER_TASK, MAX_BUDGET_TOTAL - costSoFar),
     disallowedTools: ["EnterPlanMode", "ExitPlanMode", "AskUserQuestion"],
-    includeHookEvents: false,
     hooks: {
-      // 【核心】PostToolUse 实时捕获真实改动 —— 取代 bash 版的 git diff 猜测
+      // PostToolUse 实时捕获真实改动 —— 取代 git diff 猜测
       PostToolUse: [{
         hooks: [async (input) => {
           lastHeartbeat = Date.now();     // 任何工具调用都刷新心跳
           startWatchdog();
           toolCalls++;
-          // PostToolUseHookInput 带 tool_name/tool_input；union 需先收窄
           if (input.hook_event_name !== "PostToolUse") return {};
           const ti = input.tool_input as Record<string, unknown> | undefined;
           const path = ti?.file_path ?? ti?.path ?? ti?.notebook_path;
@@ -238,9 +226,7 @@ async function runOneTask(taskLine: string, sessionId: string | null, costSoFar:
           return {};
         }],
       }],
-      // 【核心】Stop hook：claude 想停时我们看真实改动决定是否放行
-      // 这里不 block（我们用 for-await 消费 result，单轮做完就停），
-      // 只用来刷新心跳，证明 claude 还活着。
+      // Stop 只用来刷新心跳（单轮靠 for-await result 决定停，不 block）
       Stop: [{
         hooks: [async () => { lastHeartbeat = Date.now(); return {}; }],
       }],
@@ -294,7 +280,7 @@ async function mainLoop() {
     const { total, remaining } = readTasks();
 
     if (remaining === 0) {
-      // 【防假完成】有阻塞标记或全程零 commit → 不退出
+      // 防假完成：有阻塞标记或全程零 commit → 不退出，挂起待人工核实
       const text = existsSync(TASK_FILE) ? readFileSync(TASK_FILE, "utf8") : "";
       const blocked = (text.match(/^- \[~\]/gm) || []).length;
       if (blocked > 0) {
@@ -315,7 +301,6 @@ async function mainLoop() {
       return;
     }
 
-    // 全程预算护栏
     if (totalCost >= MAX_BUDGET_TOTAL) {
       log(`🛑 达到全程预算上限 $${MAX_BUDGET_TOTAL}，停止`);
       writeStatus({ status: "budget_exceeded", current_task: "预算耗尽", remaining, completed: total - remaining, cost_usd: totalCost });
@@ -332,8 +317,8 @@ async function mainLoop() {
 
     const { result, wroteFiles, toolCalls, aborted } = await runOneTask(taskLine, sessionId, totalCost);
 
-    // 【核心差异】完成判定看真实结构化信号，不是 git diff 猜测
-    const didRealWork = wroteFiles.length > 0;            // hook 实时捕获的文件写入
+    // 完成判定看真实结构化信号，不是 git diff 猜测
+    const didRealWork = wroteFiles.length > 0;
     const taskKey = taskLine.slice(0, 120);
 
     if (result?.session_id && result.session_id !== sessionId) {
@@ -349,7 +334,7 @@ async function mainLoop() {
       }
     }
 
-    // 撞上下文撑爆（原脚本 Bug4）：开新会话重试同任务，不标阻塞
+    // 撞上下文撑爆/超时：弃会话下轮开新会话重试同任务，不标阻塞
     if (aborted || (result && /context length|exceeds/i.test(JSON.stringify(result)))) {
       log("🧠 疑上下文撑爆/超时，弃会话下轮开新会话重试同任务");
       rmSync(SESSION_FILE, { force: true });
@@ -361,7 +346,6 @@ async function mainLoop() {
     }
 
     if (didRealWork) {
-      // 有真实改动 → 打勾推进
       tickFirst();
       const committed = gitCommitIfChanged(taskLine);
       if (committed) hadAnyCommit = true;
@@ -413,7 +397,6 @@ async function bootstrapTasks(goal: string) {
   let text = "";
   for await (const msg of q) {
     if (msg.type === "result") {
-      // result 文本只在 success 分支存在；error 分支用 errors[]
       const r = msg as SDKResultMessage;
       text = r.subtype === "success" ? (r.result ?? "") : (r.errors ?? []).join("\n");
     } else if (msg.type === "assistant") {
@@ -518,19 +501,3 @@ main().catch((e) => {
   rmSync(PID_FILE, { force: true });
   process.exit(1);
 });
-
-// ---------------- 对照表（orchestrator.ts vs unattended.sh）----------------
-//
-// | unattended.sh（bash）              | orchestrator.ts（SDK）                          |
-// |-----------------------------------|-------------------------------------------------|
-// | claude -p 子进程 + stream-json grep | query() 进程内 async generator，直接拿结构化消息 |
-// | 心跳文件 + 5min 轮询看门狗           | PostToolUse/Stop hook 实时刷新心跳，abortController 超时 abort |
-// | git diff --cached 猜有没有干活      | PostToolUse hook 实时捕获写入 + num_turns/result |
-// | --resume <id> -p 每轮续接           | options.resume = sessionId（进程内续接）          |
-// | 每 5 轮手动 /compact               | auto-compact 默认开（无需手管）                   |
-// | set -e + grep -c 杀脚本（6 个 bug） | 纯 JS async，无 shell，这类 bug 物理上不存在      |
-// | 无成本护栏                          | maxBudgetUsd 单任务 + 全程双护栏                  |
-// | EnterPlanMode/AskUserQuestion 卡住 | disallowedTools 直接移除                          |
-// | 400 撑爆开新会话                    | abort + 删 SESSION_FILE 下轮开新会话              |
-// | sed 打勾                            | tickFirst()（保留 .task.md 格式兼容）             |
-// | git commit + Co-Authored-By        | gitCommitIfChanged()（逻辑一致）                   |
