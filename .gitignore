@@ -3,11 +3,16 @@ night_run.log
 .status
 .pid.main
 .pid.watchdog
+.pid
+.session_id
 .task.md
 .task.md.raw
 
 # Claude 本地记忆/会话
 .claude/
+
+# Node 依赖与构建产物
+node_modules/
 
 # 系统文件
 .DS_Store
