@@ -18,7 +18,7 @@ loop --cwd /path/to/your/project --status        # 实时状态
 loop --cwd /path/to/your/project --report        # 运行报告
 ```
 
-**职责边界**：orchestrator 只管推进 + 把结果结构化落盘（`state.json` + `events.jsonl`），**不发战报**。战报由外部 agent（如 claw）定时读这些结果自行组织发送。推进靠 `--watch` 长进程，崩了重启续跑，不依赖外部触发。
+**职责边界**：orchestrator 只管推进 + 把结果结构化落盘（`state.json` + `events.jsonl`），**不发战报**。战报由外部 agent 定时读这些结果自行组织发送。推进靠 `--watch` 长进程，崩了重启续跑，不依赖外部触发。
 
 ## 卸载 / 重装 / 升级
 
@@ -72,10 +72,10 @@ chmod 600 ~/.config/loop.env   # 密钥别让别的用户读到
 
 ## 可选：外部 agent 发战报 / 注册 skill
 
-orchestrator 把结果结构化到 `state.json`（恢复点）+ `events.jsonl`（审计流）+ `.task.md`（进度），**不发战报**。由 claw 等外部 agent 起定时任务读这些结果自行组织发送：
+orchestrator 把结果结构化到 `state.json`（恢复点）+ `events.jsonl`（审计流）+ `.task.md`（进度），**不发战报**。由外部 agent 起定时任务读这些结果自行组织发送：
 
 ```bash
-# claw 定时读结果（具体由 claw 的定时机制实现）：
+# 外部 agent 定时读结果（具体由该 agent 的定时机制实现）：
 cat /path/to/your/project/state.json          # status/loop_count/cost/last_termination 等
 tail -8 /path/to/your/project/events.jsonl    # 最近事件
 ```

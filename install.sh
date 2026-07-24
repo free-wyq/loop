@@ -122,7 +122,7 @@ exec "'"$DEST"'/node_modules/.bin/tsx" "'"$DEST"'/orchestrator.ts" "$@"
   echo "     （非交互进程不 source ~/.bashrc，密钥得放这里 orchestrator 才读得到）"
   echo
   echo "  战报/推送：orchestrator 只把结果结构化到 state.json/events.jsonl，"
-  echo "  由 claw 等 agent 读这些结果自行组织发送，orchestrator 不发战报。"
+  echo "  由外部 agent 读这些结果自行组织发送，orchestrator 不发战报。"
   echo
   echo "  注册 skill（可选；多数 agent 的扫描器不跟 symlink，要拷真目录）："
   echo "    cp -r $DEST/skill ~/.claude/skills/loop-scheduler   # Claude Code（换 agent 换目录）"

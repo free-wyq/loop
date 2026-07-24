@@ -1,6 +1,6 @@
 ---
 name: loop-scheduler
-description: "loop-orchestrator 接入：--watch 长进程自管推进，结果结构化到 state.json/events.jsonl。外部 agent（如 claw）定时读这些结果自行组织发战报。orchestrator 不发战报、不依赖外部触发推进。"
+description: "loop-orchestrator 接入：--watch 长进程自管推进，结果结构化到 state.json/events.jsonl。外部 agent 定时读这些结果自行组织发战报。orchestrator 不发战报、不依赖外部触发推进。"
 ---
 
 # Loop Scheduler
@@ -10,9 +10,26 @@ loop-orchestrator（`orchestrator.ts`，用 `@anthropic-ai/claude-agent-sdk` 的
 ## 职责边界
 
 - **orchestrator**：只管推进 + 把结果结构化落盘（`state.json` 恢复点 + `events.jsonl` 审计流）。不发战报、不推送。
-- **外部 agent（如 claw）**：定时读 state/events 这些结构化结果，自行组织发送战报。战报文案、推送频道、频率全由 agent 决定，orchestrator 不掺和。
+- **外部 agent**：定时读 state/events 这些结构化结果，自行组织发送战报。战报文案、推送频道、频率全由 agent 决定，orchestrator 不掺和。
 
 推进靠 `--watch` 长进程（一次拉起自驱跑到完成），崩了重启续跑，不依赖外部触发。
+
+## 架构
+
+```mermaid
+flowchart TB
+    User([用户/agent 拉起])
+    User -->|"--watch 自驱"| BOOT[bootstrap 拆任务 → .task.md]
+    BOOT --> TICK["tick 幂等单步<br/>while 循环"]
+    TICK -->|"★成本立即写"| STATE[("state.json<br/>原子写 · 恢复点")]
+    TICK --> EVENTS[("events.jsonl<br/>append-only 审计")]
+    TICK --> TASK[(".task.md<br/>进度真相源")]
+    Ext([外部 agent])
+    Ext -->|"定时读结果"| STATE
+    Ext -.->|"自行组织发战报"| Push([推送频道])
+```
+
+三者解耦：推进（watch 自管，崩了重启续跑）/ 结果（可靠落盘）/ 战报（外部 agent 读结果自组织）。watch 挂了不影响外部 agent 读已落盘结果发战报；外部 agent 挂了不影响 watch 推进。
 
 ## 结构化结果（agent 发战报的数据源）
 
@@ -77,18 +94,18 @@ loop --cwd /path/to/project "构建一个 Go REST API"
 
 ⚠️ 目标项目绝不能是 loop 仓库自身——会污染 git 历史。
 
-### 2. claw 定时读结果发战报
+### 2. 外部 agent 定时读结果发战报
 
-claw 起一个定时任务，读 state.json/events.jsonl/.task.md，按自己的判断组织战报文案、推送到自己的频道：
+起一个定时任务，读 state.json/events.jsonl/.task.md，按自己的判断组织战报文案、推送到自己的频道：
 
 ```bash
-# claw 定时（示例，具体由 claw 的定时机制实现）
+# 定时（示例，具体由该 agent 的定时机制实现）
 # 读最新状态：
 cat /path/to/project/state.json
 tail -8 /path/to/project/events.jsonl
 ```
 
-orchestrator 不参与战报生成——它只保证结果结构化、可靠落盘，claw 爱怎么读、怎么推都行。推进与观察彻底解耦：watch 挂了不影响 claw 读结果发战报，claw 挂了不影响 watch 推进。
+orchestrator 不参与战报生成——它只保证结果结构化、可靠落盘，外部 agent 爱怎么读、怎么推都行。推进与观察彻底解耦：watch 挂了不影响外部 agent 读结果发战报，外部 agent 挂了不影响 watch 推进。
 
 ### 3. 操控命令
 
@@ -138,6 +155,6 @@ cp ~/.local/share/loop/loop.env.example ~/.config/loop.env && chmod 600 ~/.confi
 
 1. **`orchestrator.ts` 不能搬走**——依赖 loop 仓库的 `node_modules`，本体留仓库跟版本走。
 2. **目标项目绝不能是 loop 仓库自身**——会污染 git 历史。
-3. **推进靠 watch 长进程**——它崩了需重启才继续。要无人值守自动拉起，靠 systemd `Restart=always` / supervisor / claw 守护。
-4. **orchestrator 不发战报**——只把结果结构化到 state/events，战报由 claw 等 agent 读结果自行发。
+3. **推进靠 watch 长进程**——它崩了需重启才继续。要无人值守自动拉起，靠 systemd `Restart=always` / supervisor / 外部 agent 守护。
+4. **orchestrator 不发战报**——只把结果结构化到 state/events，战报由外部 agent 读结果自行发。
 5. **改目标项目换 `--cwd`**，别改 orchestrator。

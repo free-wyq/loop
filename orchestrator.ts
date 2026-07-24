@@ -15,7 +15,7 @@
 // 永不使用 continue（避免旧会话污染）。session_id 由 .session_id 文件单源管理（不进 state.json）。
 //
 // 设计原则：orchestrator 只管推进 + 把结果结构化落盘（state.json + events.jsonl）。
-// 战报/推送由外部 agent（如 claw）读这些结构化结果自行组织发送，orchestrator 不发战报。
+// 战报/推送由外部 agent 读这些结构化结果自行组织发送，orchestrator 不发战报。
 // 推进靠 --watch 长进程（tick 内核 + state/events 落盘，崩溃可恢复），不依赖外部触发。
 
 import { query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
