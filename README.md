@@ -208,7 +208,19 @@ loop 升级后重跑上述命令刷新 skill 内容。详见 [install.md](instal
 
 `autoCompactEnabled` 默认 true：上下文快满自动压成摘要，会话不中断、`session_id` 不变。真撑爆了（query 报 `error_during_execution` 含 context）→ 弃会话重开。
 
-⚠️ GLM 等代理模型上下文只有 ~300k，且 `autoCompact` 之前的单轮可能就把项目源码灌满了。worker prompt 已加节流铁律：只读与当前任务相关的文件、复用 `.claude/memory/` 已有背景、大文件 Grep 定位再按行 Read。目标项目可放 `.claudeignore` 进一步压扫描范围。orchestrator 这层不手管上下文。
+### bootstrap 知识优先 + 按需探索（防拆任务爆上下文）
+
+旧设计让 LLM 自己 agentic 探索项目拿上下文 → 要么探索过度爆上下文（Claude Code 拆得准但爆）、要么没上下文纯猜（Hermes 拆得不准）。根因是「谁拿项目上下文」绑在 LLM 身上。
+
+改法：**把最高价值的现成知识由 orchestrator 代码直接读出来喂进 prompt 当基线，模型拿这些做底，剩余按需自己探索——不限制死，只把它从「无脑全扫」掰向「已知为基、按需补」。** 基线优先级：
+
+1. `CLAUDE.md`（claude code 沉淀的项目说明书，密度最高）
+2. `.claude/memory/*.md` 累积记忆（跳过 `progress.md` 流水账）
+3. 退路：都没有时代码轻量勘察目录树（限深 3 层 + manifest，跳依赖/构建产物大目录、保留隐藏文件）当探索起点，总长截断 20k
+
+**不锁死文件工具**：CLAUDE.md/memory 当基线喂进来，剩下细节模型按需 Read/Grep——无脑全扫才爆上下文，按需探索不会。旧工程复用已有知识、不重扫；真新工程走退路给个地图当起点。Hermes 以前不准就是没上下文，现在基线喂进去了，谁拆都准。
+
+⚠️ GLM 等代理模型上下文只有 ~300k。worker prompt 已加节流铁律：只读与当前任务相关的文件、复用 `.claude/memory/` 已有背景、大文件 Grep 定位再按行 Read。目标项目可放 `.claudeignore` 进一步压扫描范围。orchestrator 这层不手管上下文。
 
 ---
 

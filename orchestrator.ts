@@ -20,7 +20,7 @@
 
 import { query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmSync, statSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { parseArgs as nodeParseArgs } from "node:util";
@@ -810,16 +810,83 @@ async function watch(goal: string) {
   }
 }
 
-// ---------------- 首次任务拆解（保留不变）----------------
+// ---------------- bootstrap：知识优先，按需探索 ----------------
+// 旧设计让 LLM 自己 agentic 探索项目拿上下文 → 要么探索过度爆上下文（Claude Code 拆得准但爆）、
+// 要么没上下文纯靠 goal 猜（Hermes 拆得不准）。根因是「谁拿项目上下文」绑在了 LLM 身上。
+// 改法：把最高价值的现成知识（CLAUDE.md + memory）由 orchestrator 代码直接读出来喂进 prompt，
+// 模型拿这些做基线，剩下不够的按需自己探索——不限制死，只把它从「无脑全扫」掰向「已知为基、按需补」。
+// 复用 claude code 已沉淀的知识，旧工程不重扫；新工程走退路给个目录概览当起点。
+
+// 退路：新工程/没用过 claude code 时，代码读一个轻量项目结构概览当探索起点（不是真相、只是地图）。
+// 限深 3 层、跳依赖/构建产物大目录（node_modules 等）、保留隐藏文件（.claude 等可能有价值）+ manifest。
+function surveyProjectTree(): string {
+  const IGNORE = new Set(["node_modules", ".git", "dist", "build", ".next", "target", "vendor", "__pycache__", ".venv", "out"]);
+  const lines: string[] = [];
+  const walk = (dir: string, depth: number, prefix: string) => {
+    if (depth > 3) return;
+    let entries: import("node:fs").Dirent[];
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (IGNORE.has(e.name)) continue;            // 只跳依赖/构建产物等大目录；隐藏文件（.claude 等）保留——可能有价值
+      const rel = prefix ? `${prefix}/${e.name}` : e.name;
+      lines.push(`${e.isDirectory() ? "📁" : "📄"} ${rel}`);
+      if (e.isDirectory() && depth < 3) walk(`${dir}/${e.name}`, depth + 1, rel);
+    }
+  };
+  walk(".", 1, "");
+  const manifests = ["package.json", "go.mod", "requirements.txt", "Cargo.toml", "pyproject.toml", "pom.xml"];
+  const mf: string[] = [];
+  for (const m of manifests) {
+    if (!existsSync(m)) continue;
+    try {
+      const c = readFileSync(m, "utf8");
+      mf.push(`### ${m}\n${c.length > 1500 ? c.slice(0, 1500) + "\n...(截断)" : c}`);
+    } catch { /* skip */ }
+  }
+  return lines.slice(0, 300).join("\n") + (mf.length ? "\n\n" + mf.join("\n\n") : "");
+}
+
+// 读最高价值的现成知识喂给 bootstrap。CLAUDE.md → memory 累积记忆（这是「已知」，直接给）。
+// 给完基线后不锁死——剩余细节模型按需自己探索（prompt 说明），而不是无脑全扫。
+function loadProjectKnowledge(): string {
+  const parts: string[] = [];
+  if (existsSync("CLAUDE.md")) {
+    parts.push("## CLAUDE.md（项目说明书）\n" + readFileSync("CLAUDE.md", "utf8"));
+  }
+  if (existsSync(MEMO_DIR)) {
+    // 累积记忆：架构/约定/模块边界等。跳过 progress.md（loop 自己写的增量流水账，对「怎么拆」没价值）。
+    let memos: string[] = [];
+    try { memos = readdirSync(MEMO_DIR).filter((f) => f.endsWith(".md") && f !== "progress.md").sort(); }
+    catch { memos = []; }
+    for (const f of memos) {
+      try { parts.push(`## .claude/memory/${f}\n` + readFileSync(`${MEMO_DIR}/${f}`, "utf8")); }
+      catch { /* skip */ }
+    }
+  }
+  if (parts.length === 0) {
+    // 真新工程/没用过 claude code → 退路：代码轻量勘察当探索起点
+    parts.push("## 项目结构（自动勘察）\n" + surveyProjectTree());
+  }
+  let text = parts.join("\n\n");
+  if (text.length > 20_000) text = text.slice(0, 20_000) + "\n...(已截断，详见项目文件)";  // 截断防爆
+  return text;
+}
 
 async function bootstrapTasks(goal: string) {
   log("首次运行，拆解任务...");
   log(`目标：${goal}`);
+  const knowledge = loadProjectKnowledge();
+  log(`📚 已加载项目知识 ${knowledge.length} 字符（CLAUDE.md/memory 基线 + 按需探索）`);
   const q = query({
-    prompt: `根据用户目标拆解为最小可执行任务列表。
+    // 高价值现成知识由代码喂进来当基线；CLAUDE.md/memory 之外、拆任务还需要细节时，模型按需自己探索，
+    // 不要无脑全扫（那是爆上下文的根因）。已知为基、按需补，而非限制死。
+    prompt: `根据用户目标拆解为最小可执行任务列表。下方【项目背景】是已为你准备的最高价值知识（CLAUDE.md / 记忆 / 勘察），先吃透它做基线；拆任务还需的细节按需自己探索，但只读相关的、别无脑全扫。
+
+${knowledge}
+
 用户目标：${goal}
 要求：
-- 每个任务足够小（一个函数、一个文件、一个接口）
+- 每个任务足够小（一个函数、一个文件、一个接口），一个会话内能独立完成
 - 按依赖顺序排列
 - 输出格式只有任务列表，每行一个：
 - [ ] 任务描述
@@ -830,6 +897,7 @@ async function bootstrapTasks(goal: string) {
       allowDangerouslySkipPermissions: true,
       maxTurns: hasLimit(BOOTSTRAP_MAX_TURNS) ? BOOTSTRAP_MAX_TURNS : undefined,
       ...(hasLimit(BOOTSTRAP_MAX_BUDGET) ? { maxBudgetUsd: BOOTSTRAP_MAX_BUDGET } : {}),
+      // 不禁文件工具：CLAUDE.md/memory 当基线喂进来了，剩下按需探索。无脑全扫才爆上下文，按需探索不会。
       disallowedTools: ["EnterPlanMode", "ExitPlanMode", "AskUserQuestion"],
     },
   });
