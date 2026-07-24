@@ -106,6 +106,13 @@ exec "'"$DEST"'/node_modules/.bin/tsx" "'"$DEST"'/orchestrator.ts" "$@"
   chmod +x "$DEST/skill/loop-tick.sh"
   [ -f "$CONF_FILE" ] || cp "$DEST/skill/loop-tick.conf.example" "$CONF_FILE"
 
+  # 5. 配置模板：loop.env.example 拷到 ~/.config（不覆盖已有，已有让用户自己改——含密钥）
+  if [ ! -f "$CONF_DIR/loop.env" ] && [ -f "$DEST/loop.env.example" ]; then
+    cp "$DEST/loop.env.example" "$CONF_DIR/loop.env"
+    chmod 600 "$CONF_DIR/loop.env"
+    say "已生成 $CONF_DIR/loop.env 模板（填 ANTHROPIC_API_KEY 后即可用，已限 600 权限）"
+  fi
+
   # 5. PATH 检查（不替用户改 shell rc，只提示）
   case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
@@ -122,6 +129,9 @@ exec "'"$DEST"'/node_modules/.bin/tsx" "'"$DEST"'/orchestrator.ts" "$@"
   echo "  接定时器：  loop-tick /path/to/your/project"
   echo
   echo "  ⚠️ --cwd 指向你要开发的目标项目，别指向 loop 仓库自身。"
+  echo
+  echo "  ⚠️ 配密钥：编辑 $CONF_DIR/loop.env 填 ANTHROPIC_API_KEY=sk-..."
+  echo "     （cron/systemd 不 source ~/.bashrc，密钥得放这里 orchestrator 才读得到）"
   echo
   echo "  注册 skill（可选；多数 agent 的扫描器不跟 symlink，要拷真目录）："
   echo "    cp -r $DEST/skill ~/.claude/skills/loop-scheduler   # Claude Code（换 agent 换目录）"
@@ -141,6 +151,13 @@ do_uninstall() {
   if [ -e "$CONF_FILE" ]; then
     mv "$CONF_FILE" "$CONF_FILE.bak" 2>/dev/null || rm -f "$CONF_FILE"
     say "配置已备份 → $CONF_FILE.bak"
+    removed=1
+  fi
+  # loop.env 含密钥，同样备份再删（不静默抹）
+  local loop_env="$CONF_DIR/loop.env"
+  if [ -e "$loop_env" ]; then
+    mv "$loop_env" "$loop_env.bak" 2>/dev/null || rm -f "$loop_env"
+    say "loop.env 已备份 → $loop_env.bak"
     removed=1
   fi
 

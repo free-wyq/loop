@@ -119,6 +119,17 @@ cp -r /path/to/loop/skill "$SKILLS_DIR/loop-scheduler"
 | 恢复 | `loop --cwd <proj> --resume`（删 .stop） |
 | 改间隔 | 改你那个调度器的 schedule（cron/edit timer/hermes cron edit），不动 wrapper |
 
+## 密钥 / 限额配置
+
+调度器跑干净 env 不 source `~/.bashrc`，密钥得写进 `~/.config/loop.env`（orchestrator 启动自动读，已 export 的不覆盖）：
+
+```bash
+cp ~/.local/share/loop/loop.env.example ~/.config/loop.env && chmod 600 ~/.config/loop.env
+# 填 ANTHROPIC_API_KEY=sk-...；走代理加 ANTHROPIC_BASE_URL=http://...:3000、ANTHROPIC_MODEL=glm-5.1
+```
+
+限额默认全 `0 = 不限`（自托管/免费代理模型没有按量计费，预算护栏纯属挡路，实测 GLM 代理单任务 $3/bootstrap $1 都不够会崩）。要护栏再设正数：`LOOP_MAX_TURNS`/`LOOP_MAX_BUDGET_PER_TASK`/`LOOP_MAX_BUDGET_TOTAL`/`LOOP_BOOTSTRAP_MAX_TURNS`/`LOOP_BOOTSTRAP_MAX_BUDGET`/`LOOP_STALL_LIMIT`/`LOOP_ABORT_TIMEOUT_MIN`/`LOOP_SESSION_RETRY_LIMIT`。详见 [install.md](../install.md)。
+
 ## 崩溃恢复（自动，无需人工）
 
 每次跑的是幂等 `--tick`。某 tick 被杀（重启 / gateway 挂 / kill -9）：

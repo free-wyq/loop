@@ -103,9 +103,30 @@ sequenceDiagram
 # 1. 一条命令安装（agent 无关，装到 ~/.local）
 curl -fsSL https://raw.githubusercontent.com/free-wyq/loop/main/install.sh | bash
 
-# 2. 跑（产物写在 --cwd 指定的项目目录）
+# 2. 配密钥（非交互调度器不 source ~/.bashrc，写进 loop.env 才拿得到）
+cp ~/.local/share/loop/loop.env.example ~/.config/loop.env
+chmod 600 ~/.config/loop.env   # 编辑填 ANTHROPIC_API_KEY=sk-...（走代理再加 ANTHROPIC_BASE_URL/ANTHROPIC_MODEL）
+
+# 3. 跑（产物写在 --cwd 指定的项目目录）
 loop --cwd /path/to/project "构建一个 Go REST API"
 ```
+
+### 配置（密钥 / 代理 / 限额）
+
+cron / systemd / hermes cron 跑**干净 env 不 source `~/.bashrc`**，密钥得写进 `~/.config/loop.env`，orchestrator 启动自动读（已 export 的不覆盖）。限额默认全 `0 = 不限`（自托管/免费代理模型没有按量计费，预算护栏纯属挡路），要护栏再在 `loop.env` 设正数。详见 [install.md](install.md)。
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | 鉴权（写进 loop.env） |
+| `ANTHROPIC_BASE_URL` | 官方 | 走代理/中转才填 |
+| `ANTHROPIC_MODEL` 等 | — | 走代理时指定模型名 |
+| `LOOP_MAX_TURNS` | 0（不限） | 单任务最大轮数 |
+| `LOOP_MAX_BUDGET_PER_TASK` | 0（不限） | 单任务美元上限 |
+| `LOOP_MAX_BUDGET_TOTAL` | 0（不限） | 全程美元上限 |
+| `LOOP_BOOTSTRAP_MAX_TURNS` / `LOOP_BOOTSTRAP_MAX_BUDGET` | 0（不限） | bootstrap 拆解限额 |
+| `LOOP_STALL_LIMIT` | 3 | 同任务连续零改动 N 次标阻塞 |
+| `LOOP_ABORT_TIMEOUT_MIN` | 60 | 单任务超 N 分钟无进展则 abort |
+| `LOOP_SESSION_RETRY_LIMIT` | 3 | 当前任务连续 ctx 撑爆 N 次标阻塞 |
 
 ## 命令一览
 
@@ -183,9 +204,11 @@ loop 升级后重跑上述命令刷新 skill 内容。详见 [install.md](instal
 | `.tick.lock` | 进程级并发锁 |
 | `night_run.log` | 人类可读文本日志 |
 
-## 上下文管理（SDK 自带）
+## 上下文管理（SDK 自带 + prompt 节流）
 
-`autoCompactEnabled` 默认 true：上下文快满自动压成摘要，会话不中断、`session_id` 不变。真撑爆了（query 报 `error_during_execution` 含 context）→ 弃会话重开。orchestrator 这层不用管上下文。
+`autoCompactEnabled` 默认 true：上下文快满自动压成摘要，会话不中断、`session_id` 不变。真撑爆了（query 报 `error_during_execution` 含 context）→ 弃会话重开。
+
+⚠️ GLM 等代理模型上下文只有 ~300k，且 `autoCompact` 之前的单轮可能就把项目源码灌满了。worker prompt 已加节流铁律：只读与当前任务相关的文件、复用 `.claude/memory/` 已有背景、大文件 Grep 定位再按行 Read。目标项目可放 `.claudeignore` 进一步压扫描范围。orchestrator 这层不手管上下文。
 
 ---
 
@@ -195,9 +218,10 @@ loop 升级后重跑上述命令刷新 skill 内容。详见 [install.md](instal
 - `PostToolUse` hook 实时捕获真实文件写入 → 完成判定看真实事件（不靠 `git diff` 猜）
 - `abortController` + `Stop` hook 刷新心跳 → 看门狗事件驱动，不轮询
 - `disallowedTools` 移除 `EnterPlanMode`/`ExitPlanMode`/`AskUserQuestion`（防卡住）
-- `maxBudgetUsd` 单任务 + 全程双护栏
+- 预算/轮数护栏默认关（`0 = 不限`），走付费模型再在 `loop.env` 设正数（单任务 + 全程双护栏）
 - 会话策略：首轮新会话、后续 resume、**永不 continue**（防旧会话污染）
 - 每轮自动 commit（本地不 push），带 Co-Authored-By trailer
+- 日志用本地时间（跟随系统时区 / `TZ`），不再 `toISOString()` 输出 UTC
 
 ## 验证
 

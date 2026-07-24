@@ -22,6 +22,7 @@ import { query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/cla
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { homedir } from "node:os";
 import { parseArgs as nodeParseArgs } from "node:util";
 import lockfile from "proper-lockfile";
 
@@ -29,6 +30,52 @@ import lockfile from "proper-lockfile";
 // TS 对「untyped module」不允许 inline declare module 增强，必须外置）。见 write-file-atomic.d.ts。
 import writeFileAtomic from "write-file-atomic";
 const writeAtomic = (path: string, data: string) => writeFileAtomic.sync(path, data);
+
+// ---------------- 启动期：加载 loop.env（调度器友好）----------------
+// cron / systemd / hermes cron 这类非交互调度器跑的是干净 env，不会 source ~/.bashrc——
+// 用户写在 ~/.bashrc 里的 ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL 它们根本拿不到
+// （实测：调度器里得手 export + sed 抠 ~/.bashrc 才跑得通，极脆、还常触发审批）。
+// 放一份 KEY=VALUE 进 ~/.config/loop.env，orchestrator 启动时读进 process.env；
+// 已 export 的环境变量优先、不覆盖。LOOP_ENV_FILE 可指到别处。
+function loadEnvFileOnce() {
+  const path = process.env.LOOP_ENV_FILE || `${homedir()}/.config/loop.env`;
+  let text: string;
+  try { text = readFileSync(path, "utf8"); } catch { return; }  // 不存在/读不到就跳过
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    if (val.length >= 2 && ((val[0] === '"' && val[val.length - 1] === '"') ||
+                           (val[0] === "'" && val[val.length - 1] === "'"))) {
+      val = val.slice(1, -1);
+    }
+    if (!key) continue;
+    if (process.env[key] === undefined) process.env[key] = val;  // 已 export 的不覆盖
+  }
+}
+loadEnvFileOnce();
+
+// 读环境变量配置的限额：贵模型（如 GLM 代理单次成本高于 Anthropic）或大项目可临时调宽，
+// 不用改代码、不用重装。写进 ~/.config/loop.env 即可（见上 loadEnvFileOnce）。
+// 约定：0 = 不限（默认）。自托管/免费代理的模型没有按量计费，预算护栏纯属挡路（实测 GLM 代理
+// 单任务 $3、bootstrap $1 都不够会崩成 blocked）。要护栏再设正数；轮数同理 0 = 不限。
+const envInt = (name: string, def: number): number => {
+  const v = process.env[name];
+  if (v == null || v === "") return def;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : def;
+};
+const envNum = (name: string, def: number): number => {
+  const v = process.env[name];
+  if (v == null || v === "") return def;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : def;
+};
+const UNLIMITED = 0;  // 0 表示不限；配置项比较时用 hasLimit(n) = n > 0
+const hasLimit = (n: number) => n > 0;
 
 // ---------------- 配置 ----------------
 
@@ -45,19 +92,36 @@ const EVENTS_FILE = "events.jsonl";     // append-only 审计流
 const STOP_FILE = ".stop";              // 陷阱3：.stop 哨兵取代 --stop 杀进程（tick 是短进程，杀完 cron 又来）
 const LOCK_FILE = ".tick.lock";          // 陷阱2：flock 进程级并发保护（hermes cron overlap 只去同 job_id，不管 --watch 与 --tick 并发）
 
-const MAX_TURNS_PER_TASK = 60;      // 单任务 agentic 轮上限（防一个任务跑飞）
-const MAX_BUDGET_PER_TASK = 3;      // 单任务美元上限
-const MAX_BUDGET_TOTAL = 50;        // 全程美元上限（24h 护栏）
-const STALL_LIMIT = 3;              // 同任务连续零改动 N 次标阻塞
-const ABORT_TIMEOUT_MIN = 60;       // 单任务超 N 分钟无进展则 abort 重试
-const SESSION_RETRY_LIMIT = 3;      // 陷阱7：当前任务连续 session_dropped N 次标阻塞（防 ctx-overflow 死循环）
+const MAX_TURNS_PER_TASK = envInt("LOOP_MAX_TURNS", 0);             // 单任务 agentic 轮上限；0=不限（自托管/免费代理模型）
+const MAX_BUDGET_PER_TASK = envNum("LOOP_MAX_BUDGET_PER_TASK", 0); // 单任务美元上限；0=不限（无按量计费时护栏纯属挡路）
+const MAX_BUDGET_TOTAL = envNum("LOOP_MAX_BUDGET_TOTAL", 0);       // 全程美元上限；0=不限
+const STALL_LIMIT = envInt("LOOP_STALL_LIMIT", 3);                 // 同任务连续零改动 N 次标阻塞
+const ABORT_TIMEOUT_MIN = envInt("LOOP_ABORT_TIMEOUT_MIN", 60);    // 单任务超 N 分钟无进展则 abort 重试
+const SESSION_RETRY_LIMIT = envInt("LOOP_SESSION_RETRY_LIMIT", 3); // 陷阱7：当前任务连续 session_dropped N 次标阻塞（防 ctx-overflow 死循环）
+// bootstrap 单独一组，默认也不限。拆解是大目标，贵模型单次成本高，设限额易崩成拆解失败。
+// 用 LOOP_BOOTSTRAP_MAX_TURNS / LOOP_BOOTSTRAP_MAX_BUDGET 调（同样 0=不限）。
+const BOOTSTRAP_MAX_TURNS = envInt("LOOP_BOOTSTRAP_MAX_TURNS", 0);
+const BOOTSTRAP_MAX_BUDGET = envNum("LOOP_BOOTSTRAP_MAX_BUDGET", 0);
 const WATCH_SLEEP_MS = 5_000;       // --watch tick 间隔
 const ALREADY_RUNNING_SLEEP_MS = 30_000; // 拿不到锁时的退避
 const LOCK_STALE_MS = 60_000;        // 锁 stale 阈值：proper-lockfile 自动检测并 takeover（进程 kill -9 后 60s 可被抢）
 
 // ---------------- 工具函数 ----------------
 
-const now = () => new Date().toISOString().replace("T", " ").slice(0, 19);
+// 本地时间（跟随系统时区 / TZ 环境变量）。之前用 toISOString() 输出 UTC，
+// CST 机器日志显示差 8h（如 04:59 而非 12:59），排查时序时被误导。
+const localParts = () => {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return {
+    y: d.getFullYear(), mo: p(d.getMonth() + 1), da: p(d.getDate()),
+    h: p(d.getHours()), mi: p(d.getMinutes()), s: p(d.getSeconds()),
+  };
+};
+const now = () => {
+  const t = localParts();
+  return `${t.y}-${t.mo}-${t.da} ${t.h}:${t.mi}:${t.s}`;
+};
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // roundCost: 保留 6 位小数，防浮点累计误差
@@ -220,6 +284,12 @@ function buildPrompt(taskLine: string): string {
 4. 执行任务（代码写到文件）。遇到决策点自己拍板。
 5. 更新 .claude/memory/progress.md。
 
+## 上下文预算（防撑爆，尤其 GLM 等代理模型上下文只有 ~300k）
+- 只读与当前任务直接相关的文件，不要扫全项目、不要批量 Read 源码树。
+- 复用 .claude/memory/ 里已有的项目背景，不要重新探索。
+- 大文件用 Grep 定位再按行 Read，别整文件打开。
+- 优先 grep/ls 验证再决定读不读，避免把无关文件灌进上下文。
+
 ## 规则
 - 一次只做一个任务。不要自己改 .task.md 勾选状态——打勾由外部脚本负责。
 - 本轮结束直接结束，不要输出总结。`;
@@ -244,12 +314,25 @@ async function runOneTask(taskLine: string, sessionId: string | null, costSoFar:
   };
   startWatchdog();
 
+  // 单任务预算护栏：0 = 不限（自托管/免费代理模型按量计费无意义，设了反而崩成 blocked）。
+  // - 两者都 0：不传 maxBudgetUsd（SDK 无上限）
+  // - 只单任务设：用单任务上限
+  // - 只全程设：用全程剩余额度
+  // - 都设：取两者较小（单任务不超过全程剩余）
+  let taskBudgetCap: number | undefined;
+  if (hasLimit(MAX_BUDGET_PER_TASK) && hasLimit(MAX_BUDGET_TOTAL)) {
+    taskBudgetCap = Math.min(MAX_BUDGET_PER_TASK, Math.max(0, MAX_BUDGET_TOTAL - costSoFar));
+  } else if (hasLimit(MAX_BUDGET_PER_TASK)) {
+    taskBudgetCap = MAX_BUDGET_PER_TASK;
+  } else if (hasLimit(MAX_BUDGET_TOTAL)) {
+    taskBudgetCap = Math.max(0, MAX_BUDGET_TOTAL - costSoFar);
+  }
   const options: Parameters<typeof query>[0]["options"] = {
     abortController: ac,
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
-    maxTurns: MAX_TURNS_PER_TASK,
-    maxBudgetUsd: Math.min(MAX_BUDGET_PER_TASK, MAX_BUDGET_TOTAL - costSoFar),
+    maxTurns: hasLimit(MAX_TURNS_PER_TASK) ? MAX_TURNS_PER_TASK : undefined,
+    ...(taskBudgetCap !== undefined ? { maxBudgetUsd: taskBudgetCap } : {}),
     disallowedTools: ["EnterPlanMode", "ExitPlanMode", "AskUserQuestion"],
     hooks: {
       // PostToolUse 实时捕获真实改动 —— 取代 git diff 猜测
@@ -409,9 +492,10 @@ function countEvents(type: string): number {
 }
 
 // 生成 tick_id（时间戳 + 短随机，用于 tick_started/tick_completed 配对做崩溃检测）
+// 本地时间，跟 now() 对齐（同样跟随系统时区 / TZ）。
 function genTickId(): string {
-  const d = new Date();
-  const ts = d.toISOString().replace(/[-:T]/g, "").slice(0, 14);
+  const t = localParts();
+  const ts = `${t.y}${t.mo}${t.da}${t.h}${t.mi}${t.s}`;
   const rnd = Math.random().toString(36).slice(2, 6);
   return `${ts}-${rnd}`;
 }
@@ -533,8 +617,8 @@ async function tick(): Promise<TickOutcome> {
       return { kind: "stalled" };
     }
 
-    // 步骤7: 终止判定 B: total_cost >= MAX_BUDGET_TOTAL
-    if (state.total_cost_usd >= MAX_BUDGET_TOTAL) {
+    // 步骤7: 终止判定 B: total_cost >= MAX_BUDGET_TOTAL（0=不限，跳过）
+    if (hasLimit(MAX_BUDGET_TOTAL) && state.total_cost_usd >= MAX_BUDGET_TOTAL) {
       log(`🛑 达到全程预算上限 $${MAX_BUDGET_TOTAL}，停止`);
       appendEvent("budget_exceeded", { total_cost_usd: state.total_cost_usd, limit: MAX_BUDGET_TOTAL }, { tick_id: tickId, loop_count: state.loop_count });
       state.last_termination = { reason: "budget_exceeded", ts: now() };
@@ -744,8 +828,8 @@ async function bootstrapTasks(goal: string) {
     options: {
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
-      maxTurns: 5,
-      maxBudgetUsd: 1,
+      maxTurns: hasLimit(BOOTSTRAP_MAX_TURNS) ? BOOTSTRAP_MAX_TURNS : undefined,
+      ...(hasLimit(BOOTSTRAP_MAX_BUDGET) ? { maxBudgetUsd: BOOTSTRAP_MAX_BUDGET } : {}),
       disallowedTools: ["EnterPlanMode", "ExitPlanMode", "AskUserQuestion"],
     },
   });
@@ -795,7 +879,7 @@ function showStatus() {
   console.log(`status: ${s.status}`);
   console.log(`goal: ${s.goal || "(未设置)"}`);
   console.log(`loop_count: ${s.loop_count}`);
-  console.log(`total_cost_usd: ${s.total_cost_usd.toFixed(4)} / ${MAX_BUDGET_TOTAL}`);
+  console.log(`total_cost_usd: ${s.total_cost_usd.toFixed(4)} / ${hasLimit(MAX_BUDGET_TOTAL) ? `$${MAX_BUDGET_TOTAL}` : "不限"}`);
   console.log(`remaining: ${remaining} / ${total}`);
   console.log(`completed: ${total - remaining}`);
   console.log(`had_any_commit: ${s.had_any_commit}`);
@@ -831,7 +915,7 @@ function showReport() {
   const { total, remaining } = readTasks();
   console.log(`任务进度: ${total - remaining} / ${total} 已完成`);
   console.log(`loop_count: ${s.loop_count}`);
-  console.log(`total_cost_usd: $${s.total_cost_usd.toFixed(4)} / $${MAX_BUDGET_TOTAL}`);
+  console.log(`total_cost_usd: $${s.total_cost_usd.toFixed(4)} / ${hasLimit(MAX_BUDGET_TOTAL) ? `$${MAX_BUDGET_TOTAL}` : "不限"}`);
   console.log(`status: ${s.status}`);
   if (s.last_termination) console.log(`终止: ${s.last_termination.reason} @ ${s.last_termination.ts}`);
 
@@ -929,6 +1013,25 @@ function parseArgs(argv: string[]): {
   return { goal, cwd, action };
 }
 
+// 预检环境：调度器（cron/systemd/hermes cron）跑干净 env 不 source ~/.bashrc，
+// 用户常忘把 ANTHROPIC_API_KEY 放进 loop.env，结果 SDK 启动后跑半天才发现鉴权失败。
+// 这里在起 query 前就发现、给出可操作提示（怎么填 loop.env），省得白跑。
+// 默认只 warn 不 exit——key 可能以别的机制注入（托管 secret、CI env 注入），硬挡反而误伤。
+function preflightEnv() {
+  const key = process.env.ANTHROPIC_API_KEY;
+  const envFile = process.env.LOOP_ENV_FILE || `${homedir()}/.config/loop.env`;
+  if (key && key.trim() !== "") return;  // 有 key 就放行
+  if (existsSync(envFile)) return;       // loop.env 已在但没塞 key：不再喋喋，让 SDK 自己报鉴权错
+  console.error(
+    `⚠️ 未检测到 ANTHROPIC_API_KEY（调度器跑干净 env、不会 source ~/.bashrc）。\n` +
+    `  把密钥写进 ${envFile} 一行即可，orchestrator 启动会自动读：\n` +
+    `    ANTHROPIC_API_KEY=sk-...\n` +
+    `    ANTHROPIC_BASE_URL=http://your-proxy:3000   # 走代理才填\n` +
+    `  想换路径：export LOOP_ENV_FILE=/path/to/your.env\n` +
+    `  （key 已通过别的机制注入则忽略本提示）`
+  );
+}
+
 async function main() {
   const { goal, cwd, action } = parseArgs(process.argv.slice(2));
 
@@ -942,6 +1045,12 @@ async function main() {
   process.chdir(targetCwd);
 
   mkdirSync(MEMO_DIR, { recursive: true });
+
+  // 预检（仅 --tick/--watch 这类要真正起 query 的动作）：缺 API key 时早失败、给可操作提示。
+  // status/report/stop/resume 不起 query，不检（否则光看状态也被挡）。
+  if (action === "tick" || action === "watch" || !action) {
+    preflightEnv();
+  }
 
   if (action === "status") { showStatus(); return; }
   if (action === "report") { showReport(); return; }
