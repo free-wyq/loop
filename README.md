@@ -36,7 +36,9 @@ https://raw.githubusercontent.com/free-wyq/loop/main/install.md
 
 ```mermaid
 flowchart TB
-    User([用户/agent 拉起])
+    subgraph HOST["⚙️ 主机配置 · Linux/macOS（~/.config/）"]
+      ENV[("loop.env<br/>密钥 + 限额 0=不限")]
+    end
 
     subgraph PROJ["📁 目标项目（--cwd 指向）· 产物写入处 + git commit 仓库"]
       direction TB
@@ -54,15 +56,14 @@ flowchart TB
       SDK["PostToolUse 捕真实改动<br/>看门狗超时强杀"]
     end
 
-    ENV[("~/.config/loop.env<br/>密钥 + 限额 0=不限")]
-
-    subgraph EXTBOX["📡 外部 agent（如 claw）· 定时观察"]
-      direction LR
-      Ext([外部 agent])
-      Push([推送频道])
+    subgraph EXTBOX["📡 外部 agent / 用户（脚本之外）"]
+      direction TB
+      User([拉起 --watch])
+      Ext([定时读结果])
+      Push([自行组织发战报])
     end
 
-    User -->|"--watch 自驱"| BOOT
+    User -->|"拉起"| BOOT
     KNOW -->|"loadProjectKnowledge 喂基线"| BOOT
     ENV -.->|"限额 envInt/envNum"| BOOT
     BOOT -->|"写出"| TASK
@@ -74,24 +75,25 @@ flowchart TB
     TICK -->|"★阶段A 成本立即写"| STATE
     TICK --> EVENTS
     TICK -->|"打勾 [x]/[~]"| TASK
-    Ext -->|"定时读结果"| STATE
-    Ext -.->|"自行组织发战报"| Push
+    Ext -->|"读已落盘结果"| STATE
+    Ext -.-> Push
 
+    style HOST fill:#fff9c4,stroke:#f9a825,stroke-width:2px
     style PROJ fill:#f1f8e9,stroke:#2e7d32,stroke-width:2px
     style SCRIPT fill:#fff8e1,stroke:#e65100,stroke-width:2px
     style EXTBOX fill:#e8f4fd,stroke:#1565c0,stroke-width:2px
-    style ENV fill:#fff9c4,stroke:#f9a825,stroke-width:1px
     style STATE fill:#c8e6c9
     style EVENTS fill:#bbdefb
     style TICK fill:#ffe0b2
     style KNOW fill:#e1bee7
+    style ENV fill:#fff59d
 ```
 
-三个边界一图看清：
+四个边界一图看清（虚线=读取/喂入，实线=主推进流）：
+- ⚙️ **主机配置（黄框）**——`~/.config/loop.env` 是 Linux/macOS 主机路径（XDG 约定），存密钥 + 限额。不属项目、不属脚本：脚本启动时读进 env，已 export 的不覆盖。
 - 📁 **项目边界（绿框）**——`--cwd` 指向的目标项目：已有知识（CLAUDE.md/memory）+ 全部产物（.task.md/state.json/events.jsonl）都落在它目录里，git commit 进它仓库。
-- 🛠️ **脚本边界（橙框）**——loop orchestrator 本体（`orchestrator.ts` 的 `--watch` 进程）：bootstrap 拆解 + tick 执行是两个独立 `query()`，都吃配置层限额。
-- 📡 **外部 agent 边界（蓝框）**——定时读项目里**已落盘**的结果自行组织发战报，与脚本互不依赖（任一方挂了不影响另一方）。
-- ⚙️ 配置（黄）`~/.config/loop.env` 在中立路径，启动时读进 env（不属脚本也不属项目）。
+- 🛠️ **脚本边界（橙框）**——loop orchestrator 本体（`orchestrator.ts` 的 `--watch` 进程）：bootstrap 拆解 + tick 执行是两个独立 `query()`，都吃主机配置的限额。
+- 📡 **外部 agent 边界（蓝框）**——脚本之外的角色（用户 / claw 等）：**拉起** `--watch` 启动推进，另起定时**读已落盘结果**自行组织发战报。与脚本互不依赖（任一方挂了不影响另一方）。
 
 ### tick() 控制流（崩溃恢复核心，watch 内部循环调用）
 
