@@ -13,10 +13,12 @@ curl -fsSL https://raw.githubusercontent.com/free-wyq/loop/main/install.sh | bas
 装完即用：
 
 ```bash
-loop --cwd /path/to/your/project "你的开发目标"   # 自驱：拆任务 → 自动推进 → 自动 commit
+loop --cwd /path/to/your/project "你的开发目标"   # 推进：--watch 自驱跑到底（一次拉起）
 loop --cwd /path/to/your/project --status        # 实时状态
-loop-tick /path/to/your/project                  # 单步（给定时器/agent 调度）
+loop --cwd /path/to/your/project --report        # 运行报告
 ```
+
+**职责边界**：orchestrator 只管推进 + 把结果结构化落盘（`state.json` + `events.jsonl`），**不发战报**。战报由外部 agent（如 claw）定时读这些结果自行组织发送。推进靠 `--watch` 长进程，崩了重启续跑，不依赖外部触发。
 
 ## 卸载 / 重装 / 升级
 
@@ -68,13 +70,19 @@ chmod 600 ~/.config/loop.env   # 密钥别让别的用户读到
 | `LOOP_ABORT_TIMEOUT_MIN` | 60 | 单任务超 N 分钟无进展则 abort 重试 |
 | `LOOP_SESSION_RETRY_LIMIT` | 3 | 当前任务连续 ctx 撑爆 N 次标阻塞 |
 
-## 可选：接定时器 / 注册 skill
+## 可选：外部 agent 发战报 / 注册 skill
 
-`loop-tick` 已随安装装好，它是幂等单步 + stdout 摘要契约（空=静默），hermes cron / openclaw / crontab / systemd 读同一份输出：
+orchestrator 把结果结构化到 `state.json`（恢复点）+ `events.jsonl`（审计流）+ `.task.md`（进度），**不发战报**。由 claw 等外部 agent 起定时任务读这些结果自行组织发送：
 
 ```bash
-*/5 * * * * loop-tick /path/to/your/project >> ~/loop-tick.log 2>&1
+# claw 定时读结果（具体由 claw 的定时机制实现）：
+cat /path/to/your/project/state.json          # status/loop_count/cost/last_termination 等
+tail -8 /path/to/your/project/events.jsonl    # 最近事件
 ```
+
+战报文案、推送频道、频率全由 agent 定，orchestrator 不掺和。推进与观察彻底解耦：watch 挂了不影响 agent 读已落盘的结果；agent 挂了不影响 watch 推进。
+
+`--watch` 推进靠长进程，它崩了需重启才继续。要无人值守自动拉起，靠 systemd `Restart=always` / supervisor / agent 守护。
 
 注册 skill 进当前 agent（**拷成真目录，不要用 symlink**）：
 

@@ -10,8 +10,7 @@
 #
 # 装到 POSIX 中立路径（不进任何 agent 私有目录）：
 #   代码  ~/.local/share/loop
-#   命令  ~/.local/bin/loop        (自驱入口，透传参数给 orchestrator.ts)
-#         ~/.local/bin/loop-tick   (定时器 wrapper，symlink)
+#   命令  ~/.local/bin/loop          (自驱入口，透传参数给 orchestrator.ts)
 #   配置  ~/.config/loop-tick.conf
 set -euo pipefail
 
@@ -96,14 +95,7 @@ exec "'"$DEST"'/node_modules/.bin/tsx" "'"$DEST"'/orchestrator.ts" "$@"
 '
   chmod +x "$BIN_DIR/loop"
 
-  # 4. 装 loop-tick wrapper（symlink，指向仓库内 skill/loop-tick.sh）
-  say "安装 loop-tick wrapper 到 $BIN_DIR"
-  if [ -e "$BIN_DIR/loop-tick" ] && [ "$(readlink "$BIN_DIR/loop-tick" 2>/dev/null)" != "$DEST/skill/loop-tick.sh" ]; then
-    mv "$BIN_DIR/loop-tick" "$BIN_DIR/loop-tick.bak" 2>/dev/null || true
-    warn "已有 loop-tick，已备份为 loop-tick.bak"
-  fi
-  ln -sfn "$DEST/skill/loop-tick.sh" "$BIN_DIR/loop-tick"
-  chmod +x "$DEST/skill/loop-tick.sh"
+  # 4. 配置文件模板
   [ -f "$CONF_FILE" ] || cp "$DEST/skill/loop-tick.conf.example" "$CONF_FILE"
 
   # 5. 配置模板：loop.env.example 拷到 ~/.config（不覆盖已有，已有让用户自己改——含密钥）
@@ -113,7 +105,7 @@ exec "'"$DEST"'/node_modules/.bin/tsx" "'"$DEST"'/orchestrator.ts" "$@"
     say "已生成 $CONF_DIR/loop.env 模板（填 ANTHROPIC_API_KEY 后即可用，已限 600 权限）"
   fi
 
-  # 5. PATH 检查（不替用户改 shell rc，只提示）
+  # PATH 检查（不替用户改 shell rc，只提示）
   case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *) warn "$BIN_DIR 不在 PATH。请加一行到 shell 配置：export PATH=\"$BIN_DIR:\$PATH\"" ;;
@@ -126,12 +118,15 @@ exec "'"$DEST"'/node_modules/.bin/tsx" "'"$DEST"'/orchestrator.ts" "$@"
   echo
   echo "  直接跑：    loop --cwd /path/to/your/project \"你的开发目标\""
   echo "  看状态：    loop --cwd /path/to/your/project --status"
-  echo "  接定时器：  loop-tick /path/to/your/project"
+  echo "  运行报告：  loop --cwd /path/to/your/project --report"
   echo
   echo "  ⚠️ --cwd 指向你要开发的目标项目，别指向 loop 仓库自身。"
   echo
   echo "  ⚠️ 配密钥：编辑 $CONF_DIR/loop.env 填 ANTHROPIC_API_KEY=sk-..."
-  echo "     （cron/systemd 不 source ~/.bashrc，密钥得放这里 orchestrator 才读得到）"
+  echo "     （非交互进程不 source ~/.bashrc，密钥得放这里 orchestrator 才读得到）"
+  echo
+  echo "  战报/推送：orchestrator 只把结果结构化到 state.json/events.jsonl，"
+  echo "  由 claw 等 agent 读这些结果自行组织发送，orchestrator 不发战报。"
   echo
   echo "  注册 skill（可选；多数 agent 的扫描器不跟 symlink，要拷真目录）："
   echo "    cp -r $DEST/skill ~/.claude/skills/loop-scheduler   # Claude Code（换 agent 换目录）"
@@ -142,8 +137,8 @@ exec "'"$DEST"'/node_modules/.bin/tsx" "'"$DEST"'/orchestrator.ts" "$@"
 do_uninstall() {
   local removed=0
 
-  # 1. 清两个命令文件（含遗留 .bak 一起清）
-  for f in "$BIN_DIR/loop" "$BIN_DIR/loop-tick"; do
+  # 1. 清命令文件（含遗留 wrapper .bak 一起清）
+  for f in "$BIN_DIR/loop" "$BIN_DIR/loop-report" "$BIN_DIR/loop-tick"; do
     if [ -e "$f" ] || [ -L "$f" ]; then rm -f "$f" "$f.bak"; removed=1; fi
   done
 

@@ -3,20 +3,20 @@
 // 用法：
 //   npx tsx orchestrator.ts [--cwd <项目目录>] "目标"           # 裸跑=--watch（自驱：bootstrap+while(tick)）
 //   npx tsx orchestrator.ts [--cwd <项目目录>] --watch "目标"    # 显式自驱
-//   npx tsx orchestrator.ts [--cwd <项目目录>] --tick           # 单步（hermes cron / 手动，幂等可恢复）
-//   npx tsx orchestrator.ts [--cwd <项目目录>] --status         # 读 state.json + events.jsonl 末尾
-//   npx tsx orchestrator.ts [--cwd <项目目录>] --report         # 读 events.jsonl 统计 + night_run.log grep 兜底
+//   npx tsx orchestrator.ts [--cwd <项目目录>] --status         # 多行实时状态（给人看）
+//   npx tsx orchestrator.ts [--cwd <项目目录>] --report         # 运行报告
 //   npx tsx orchestrator.ts [--cwd <项目目录>] --stop            # 写 .stop 哨兵 + 杀 --watch PID
 //   npx tsx orchestrator.ts [--cwd <项目目录>] --resume         # 删 .stop 哨兵
 //
-// --cwd 指定目标项目目录（产物写入处 + git commit 的仓库 + 会话工作目录）；不传则用当前目录。
+// --cwd 指定目标项目目录（产物写入处 + git commit 的仓库 + 会话工作目录）；不传则用当前目录
+// 或 LOOP_PROJECT 环境变量。
 //
 // 会话策略：首轮新会话（query 返回的 session_id 落盘 .session_id），后续轮 resume 同一会话；
 // 永不使用 continue（避免旧会话污染）。session_id 由 .session_id 文件单源管理（不进 state.json）。
 //
-// 设计原则：调度器中立。tick 是无状态单步、幂等、可恢复；state.json/events.jsonl 双层持久化；
-// hermes cron / 系统 crontab / 手敲 --tick 都能驱动，orchestrator 本身不绑任何外部 agent。
-// 「稳」相关全交给成熟库：proper-lockfile 管锁（stale/fsync 全套）、write-file-atomic 管原子写（data+dir fsync）。
+// 设计原则：orchestrator 只管推进 + 把结果结构化落盘（state.json + events.jsonl）。
+// 战报/推送由外部 agent（如 claw）读这些结构化结果自行组织发送，orchestrator 不发战报。
+// 推进靠 --watch 长进程（tick 内核 + state/events 落盘，崩溃可恢复），不依赖外部触发。
 
 import { query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { execFileSync } from "node:child_process";
@@ -86,11 +86,11 @@ const MEMO_DIR = ".claude/memory";
 const SESSION_FILE = ".session_id";      // session_id 单源（不进 state.json）
 const PID_FILE = ".pid";                // --watch 进程的 PID
 
-// 陷阱1/2：新增持久化与锁文件
+// 持久化与锁文件
 const STATE_FILE = "state.json";        // 机器读恢复点快照（原子写）
 const EVENTS_FILE = "events.jsonl";     // append-only 审计流
-const STOP_FILE = ".stop";              // 陷阱3：.stop 哨兵取代 --stop 杀进程（tick 是短进程，杀完 cron 又来）
-const LOCK_FILE = ".tick.lock";          // 陷阱2：flock 进程级并发保护（hermes cron overlap 只去同 job_id，不管 --watch 与 --tick 并发）
+const STOP_FILE = ".stop";              // .stop 哨兵：--stop 写，--watch 下次 tick 检测到则退出
+const LOCK_FILE = ".tick.lock";          // flock 进程级并发保护（防多 watch / 手动与 watch 并发）
 
 const MAX_TURNS_PER_TASK = envInt("LOOP_MAX_TURNS", 0);             // 单任务 agentic 轮上限；0=不限（自托管/免费代理模型）
 const MAX_BUDGET_PER_TASK = envNum("LOOP_MAX_BUDGET_PER_TASK", 0); // 单任务美元上限；0=不限（无按量计费时护栏纯属挡路）
@@ -1042,10 +1042,10 @@ function resumeRun() {
 // ---------------- 入口 ----------------
 
 // 解析命令行（用 node:util parseArgs，零依赖 Node 18+）：
-// --cwd <dir> 可放任意位置；--tick/--watch/--status/--report/--stop/--resume 控制 action；goal 为位置参数。
+// --cwd <dir> 可放任意位置；--watch/--status/--report/--stop/--resume 控制 action；goal 为位置参数。
 function parseArgs(argv: string[]): {
   goal?: string; cwd?: string;
-  action?: "status" | "report" | "stop" | "resume" | "tick" | "watch";
+  action?: "status" | "report" | "stop" | "resume" | "watch";
 } {
   let parsed: { values: Record<string, string | boolean | undefined>; positionals: string[] };
   try {
@@ -1055,7 +1055,6 @@ function parseArgs(argv: string[]): {
       allowPositionals: true,
       options: {
         cwd: { type: "string" },
-        tick: { type: "boolean", default: false },
         watch: { type: "boolean", default: false },
         status: { type: "boolean", default: false },
         report: { type: "boolean", default: false },
@@ -1071,9 +1070,8 @@ function parseArgs(argv: string[]): {
   const cwd = typeof values.cwd === "string" ? values.cwd : undefined;
   const goal = positionals.length > 0 ? positionals[0] : undefined;
   // action 优先级：显式 flag（先到先得，互斥）
-  let action: "status" | "report" | "stop" | "resume" | "tick" | "watch" | undefined;
-  if (values.tick) action = "tick";
-  else if (values.watch) action = "watch";
+  let action: "status" | "report" | "stop" | "resume" | "watch" | undefined;
+  if (values.watch) action = "watch";
   else if (values.status) action = "status";
   else if (values.report) action = "report";
   else if (values.stop) action = "stop";
@@ -1081,31 +1079,25 @@ function parseArgs(argv: string[]): {
   return { goal, cwd, action };
 }
 
-// 预检环境：调度器（cron/systemd/hermes cron）跑干净 env 不 source ~/.bashrc，
-// 用户常忘把 ANTHROPIC_API_KEY 放进 loop.env，结果 SDK 启动后跑半天才发现鉴权失败。
-// 这里在起 query 前就发现、给出可操作提示（怎么填 loop.env），省得白跑。
-// 默认只 warn 不 exit——key 可能以别的机制注入（托管 secret、CI env 注入），硬挡反而误伤。
 function preflightEnv() {
   const key = process.env.ANTHROPIC_API_KEY;
   const envFile = process.env.LOOP_ENV_FILE || `${homedir()}/.config/loop.env`;
-  if (key && key.trim() !== "") return;  // 有 key 就放行
-  if (existsSync(envFile)) return;       // loop.env 已在但没塞 key：不再喋喋，让 SDK 自己报鉴权错
+  if (key && key.trim() !== "") return;
+  if (existsSync(envFile)) return;
   console.error(
-    `⚠️ 未检测到 ANTHROPIC_API_KEY（调度器跑干净 env、不会 source ~/.bashrc）。\n` +
-    `  把密钥写进 ${envFile} 一行即可，orchestrator 启动会自动读：\n` +
+    `⚠️ 未检测到 ANTHROPIC_API_KEY（非交互进程不 source ~/.bashrc）。\n` +
+    `  写进 ${envFile} 一行即可：\n` +
     `    ANTHROPIC_API_KEY=sk-...\n` +
     `    ANTHROPIC_BASE_URL=http://your-proxy:3000   # 走代理才填\n` +
-    `  想换路径：export LOOP_ENV_FILE=/path/to/your.env\n` +
-    `  （key 已通过别的机制注入则忽略本提示）`
+    `  （key 已通过别的机制注入则忽略）`
   );
 }
 
 async function main() {
   const { goal, cwd, action } = parseArgs(process.argv.slice(2));
 
-  // 目标目录：--cwd 显式指定 > 当前目录。chdir 后所有相对路径产物、git 仓库、
-  // 会话工作目录三者统一指向它（query 的 cwd 默认即 process.cwd()）。
-  const targetCwd = cwd ? resolve(cwd) : process.cwd();
+  // --cwd > LOOP_PROJECT env > 当前目录。chdir 后产物/git/会话目录三者统一。
+  const targetCwd = cwd ? resolve(cwd) : (process.env.LOOP_PROJECT ? resolve(process.env.LOOP_PROJECT) : process.cwd());
   if (!existsSync(targetCwd) || !statSync(targetCwd).isDirectory()) {
     console.error(`目标目录不存在或非目录: ${targetCwd}`);
     process.exit(1);
@@ -1114,35 +1106,20 @@ async function main() {
 
   mkdirSync(MEMO_DIR, { recursive: true });
 
-  // 预检（仅 --tick/--watch 这类要真正起 query 的动作）：缺 API key 时早失败、给可操作提示。
-  // status/report/stop/resume 不起 query，不检（否则光看状态也被挡）。
-  if (action === "tick" || action === "watch" || !action) {
-    preflightEnv();
-  }
+  // 预检仅对起 query 的动作（--watch/裸跑）做；只读/操控动作不挡。
+  if (action === "watch" || !action) preflightEnv();
 
   if (action === "status") { showStatus(); return; }
   if (action === "report") { showReport(); return; }
   if (action === "stop") { stopAll(); return; }
   if (action === "resume") { resumeRun(); return; }
 
-  if (action === "tick") {
-    // 单步：幂等、可恢复，任意调度器可调用
-    const o = await tick();
-    log(`tick 结果: ${o.kind}`);
-    // tick 退出码（方便调度器判断）：所有非 already_running 的状态都正常退出
-    // （terminated/stopped/already_terminated 视为完成态；already_running 静默退出不算错误）
-    process.exit(0);
-  }
-
-  // --watch 或裸跑（向后兼容）
+  // --watch 或裸跑
   if (action === "watch" || !action) {
-    // 裸跑且无 goal 且 .task.md 存在 → 续跑（--watch 语义）
-    // 裸跑且无 goal 且 .task.md 不存在 → 报错
     if (!goal && !existsSync(TASK_FILE)) {
-      console.error('首次运行需要指定目标，例如：\n  npx tsx orchestrator.ts --cwd /path/to/project --watch "构建一个Go REST API"');
+      console.error('首次运行需要指定目标，例如：\n  loop --cwd /path/to/project --watch "构建一个Go REST API"');
       process.exit(1);
     }
-    // 从 state.json 恢复 goal（如果 goal 没给但 state 里有）
     const effectiveGoal = goal ?? (existsSync(STATE_FILE) ? readStateJson().goal : "");
     if (!effectiveGoal) {
       console.error('无法确定目标：无 goal 参数且 state.json 无 goal');

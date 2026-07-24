@@ -1,73 +1,43 @@
 # loop-scheduler skill
 
-把 loop-orchestrator（`orchestrator.ts`）接成定时任务的胶水。**调度器中立**——同一份 wrapper，Hermes cron / OpenClaw / 系统 crontab / systemd timer 都能驱动。orchestrator 本身一个字不改。
+loop-orchestrator 接入说明。**orchestrator 只管推进 + 结果结构化落盘，战报由外部 agent（如 claw）读结果自行发送。**
 
-## 核心契约
+## 职责边界
 
-orchestrator 暴露幂等单步接口 `orchestrator.ts --tick`（取一个未完成任务 → 执行 → 打勾/commit → 退出）。wrapper `loop-tick.sh` 做两件事：
+- orchestrator：推进 + `state.json`(恢复点) + `events.jsonl`(审计流) 落盘。不发战报。
+- claw 等 agent：定时读 state/events/.task.md，自行组织战报推送。文案/频道/频率全由 agent 定。
 
-1. 替调度器敲这条命令（orchestrator.ts 依赖 loop 仓库 node_modules，不能搬走，用 symlink 就位）。
-2. **把全量日志写进 `night_run.log`，只在「有进展/需关注」时往 stdout 输出一行摘要。** stdout 是通用契约：任何捕获脚本输出的调度器都拿它去推送；空 stdout = 静默。不绑任何单一 agent。
+推进靠 `--watch` 长进程，崩了重启续跑，不依赖外部触发。推进与观察彻底解耦。
+
+## 结构化结果（战报数据源）
+
+- **state.json**：goal / total_cost_usd / loop_count / stall_count / had_any_commit / session_retries / status / last_termination。`status` 关键值：running / idle / completed / blocked_suspect(疑假完成) / budget_exceeded / ctx_overflow_retry。
+- **events.jsonl**：append-only 事件流。`tick_started` 无同 tick_id 的 `tick_completed` = 该 tick 崩溃。
+- **.task.md**：任务勾选 `[ ]`/`[x]`/`[~]`，进度真相源。
 
 ## 文件
 
 | 文件 | 作用 |
 |---|---|
 | `SKILL.md` | skill 说明（agent 读它执行安装/操作） |
-| `loop-tick.sh` | wrapper 本体（替调度器敲 `--tick` + outcome→stdout 映射） |
 | `loop-tick.conf.example` | 目标项目配置模板（拷成 `~/.config/loop-tick.conf`） |
 
 ## 安装
-
-**推荐：一条命令（装好 `loop`/`loop-tick` 到 `~/.local/bin`，自动配 wrapper + conf）**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/free-wyq/loop/main/install.sh | bash
 ```
 
-下面是手动装 wrapper 的方式（已有 loop 仓库源码、不想用 install.sh 时）：
-
-```bash
-# 1. wrapper 就位（symlink 进 PATH，本体留仓库跟版本走）
-ln -sf /path/to/loop/skill/loop-tick.sh /usr/local/bin/loop-tick   # 或 ~/bin，加进 PATH
-chmod +x /path/to/loop/skill/loop-tick.sh
-cp /path/to/loop/skill/loop-tick.conf.example ~/.config/loop-tick.conf
-# 编辑 ~/.config/loop-tick.conf 填 LOOP_PROJECT=<你的目标项目>
-
-# 2. 验证能单步跑通
-loop-tick
-
-# 3. 接你的调度器（三选一，wrapper/orchestrator 都不改）
-# 系统 crontab:   */5 * * * * loop-tick >> /var/log/loop-tick.log 2>&1
-# Hermes cron:    hermes cron create 'every 5m' --no-agent --script loop-tick.sh --deliver wecom
-#                 （Hermes 需额外: ln -sf .../loop-tick.sh ~/.hermes/scripts/loop-tick.sh；gateway 先跑）
-# OpenClaw/其他:   当一条可定时执行的命令调即可
-```
+装好 `loop` 到 `~/.local/bin`，自动配 conf。用法见 [SKILL.md](SKILL.md)。
 
 ## 注册成当前 agent 的 skill（可选）
 
-多数 agent 的 skill 扫描器用 find/glob 遍历 skills 目录，**默认不跟符号链接进子目录**——symlink 一个 skill 目录进去，扫描器看不见它。所以要拷成真目录：
+多数 agent 的 skill 扫描器用 find/glob 遍历 skills 目录、**默认不跟 symlink 进子目录**——symlink 进去扫描器看不见。拷成真目录：
 
 ```bash
-# 1. 推理你 agent 的 skills 目录（常见位置：Claude Code ~/.claude/skills ·
-#    Codex ~/.codex/skills · Gemini CLI ~/.gemini/skills · Cursor ~/.cursor/skills · Hermes ~/.hermes/skills）
+# 推理你 agent 的 skills 目录（常见：~/.claude/skills · ~/.codex/skills · ~/.gemini/skills · ~/.cursor/skills · ~/.hermes/skills）
 SKILLS_DIR=~/.claude/skills
-# 2. 拷成真目录（loop 升级后重跑这两行刷新 skill 内容）
 mkdir -p "$SKILLS_DIR"; rm -rf "$SKILLS_DIR/loop-scheduler"
 cp -r /path/to/loop/skill "$SKILLS_DIR/loop-scheduler"
-# 3. 验证扫描器能看到：find "$SKILLS_DIR/loop-scheduler" -name SKILL.md 应返回一行
+# 验证：find "$SKILLS_DIR/loop-scheduler" -name SKILL.md   # 应返回一行
 ```
-
-## outcome → stdout
-
-| kind | 推送 |
-|---|---|
-| advanced | ✅ 推进摘要 |
-| terminated | 🏁 终止原因 |
-| blocked | 🚧 需人工介入 |
-| session_dropped | 🧠 撞上下文继续跑 |
-| stalled / already_running / already_terminated / stopped | 静默 |
-
-## 为什么是 wrapper 而不是直接调 orchestrator
-
-`hermes cron --script` 等调度器要的是「一个文件」或「一条命令」，且 orchestrator.ts 依赖 loop 仓库的 `node_modules` 不能搬走。wrapper 就是那个快捷方式——存一行命令成文件、放调度器要的位置、顺带把 stdout 约束成「只推摘要」，所以任何调度器都能用同一份。
