@@ -37,35 +37,61 @@ https://raw.githubusercontent.com/free-wyq/loop/main/install.md
 ```mermaid
 flowchart TB
     User([用户/agent 拉起])
+
+    subgraph PROJ["📁 目标项目（--cwd 指向）· 产物写入处 + git commit 仓库"]
+      direction TB
+      KNOW[("CLAUDE.md / .claude/memory<br/>已有知识")]
+      TASK[(".task.md · 进度真相源")]
+      STATE[("state.json · 恢复点<br/>原子写")]
+      EVENTS[("events.jsonl<br/>append-only 审计")]
+    end
+
+    subgraph SCRIPT["🛠️ loop orchestrator（脚本）· --watch 长进程"]
+      direction TB
+      BOOT["bootstrap 拆任务 · query()"]
+      TICK["tick 幂等单步 · while 循环"]
+      RUN["runOneTask · query()"]
+      SDK["PostToolUse 捕真实改动<br/>看门狗超时强杀"]
+    end
+
     ENV[("~/.config/loop.env<br/>密钥 + 限额 0=不限")]
-    KNOW[("CLAUDE.md / .claude/memory")]
 
-    User -->|"--watch 自驱"| BOOT["bootstrap 拆任务<br/>query()"]
-    KNOW -->|"loadProjectKnowledge<br/>知识优先喂基线"| BOOT
-    ENV -.->|"envInt/envNum 限额"| BOOT
-    BOOT -->|"写出"| TASK[(".task.md<br/>进度真相源")]
-    BOOT --> TICK["tick 幂等单步<br/>while 循环"]
+    subgraph EXTBOX["📡 外部 agent（如 claw）· 定时观察"]
+      direction LR
+      Ext([外部 agent])
+      Push([推送频道])
+    end
 
-    TICK -->|"读首个未完成"| RUN["runOneTask<br/>query()"]
+    User -->|"--watch 自驱"| BOOT
+    KNOW -->|"loadProjectKnowledge 喂基线"| BOOT
+    ENV -.->|"限额 envInt/envNum"| BOOT
+    BOOT -->|"写出"| TASK
+    BOOT --> TICK
+    TICK -->|"读首个未完成"| RUN
     ENV -.-> RUN
-    RUN --> SDK["PostToolUse 捕真实改动<br/>看门狗超时强杀"]
+    RUN --> SDK
     SDK --> TICK
-    TICK -->|"★阶段A 成本立即写"| STATE[("state.json<br/>恢复点 · 原子写")]
-    TICK --> EVENTS[("events.jsonl<br/>append-only 审计")]
+    TICK -->|"★阶段A 成本立即写"| STATE
+    TICK --> EVENTS
     TICK -->|"打勾 [x]/[~]"| TASK
-
-    Ext([外部 agent])
     Ext -->|"定时读结果"| STATE
-    Ext -.->|"自行组织发战报"| Push([推送频道])
+    Ext -.->|"自行组织发战报"| Push
 
-    style STATE fill:#e8f5e9
-    style EVENTS fill:#e3f2fd
-    style TICK fill:#fff3e0
-    style KNOW fill:#f3e5f5
-    style ENV fill:#fff9c4
+    style PROJ fill:#f1f8e9,stroke:#2e7d32,stroke-width:2px
+    style SCRIPT fill:#fff8e1,stroke:#e65100,stroke-width:2px
+    style EXTBOX fill:#e8f4fd,stroke:#1565c0,stroke-width:2px
+    style ENV fill:#fff9c4,stroke:#f9a825,stroke-width:1px
+    style STATE fill:#c8e6c9
+    style EVENTS fill:#bbdefb
+    style TICK fill:#ffe0b2
+    style KNOW fill:#e1bee7
 ```
 
-三层技术维度（图里虚线喂入）：**知识层**（`KNOW` → bootstrap 知识优先，防拆任务爆上下文）/ **配置层**（`ENV` → 限额，0=不限通用化）/ **执行层**（bootstrap 拆解 + runOneTask 执行是两个独立 `query()`，都吃配置层限额）。
+三个边界一图看清：
+- 📁 **项目边界（绿框）**——`--cwd` 指向的目标项目：已有知识（CLAUDE.md/memory）+ 全部产物（.task.md/state.json/events.jsonl）都落在它目录里，git commit 进它仓库。
+- 🛠️ **脚本边界（橙框）**——loop orchestrator 本体（`orchestrator.ts` 的 `--watch` 进程）：bootstrap 拆解 + tick 执行是两个独立 `query()`，都吃配置层限额。
+- 📡 **外部 agent 边界（蓝框）**——定时读项目里**已落盘**的结果自行组织发战报，与脚本互不依赖（任一方挂了不影响另一方）。
+- ⚙️ 配置（黄）`~/.config/loop.env` 在中立路径，启动时读进 env（不属脚本也不属项目）。
 
 ### tick() 控制流（崩溃恢复核心，watch 内部循环调用）
 
