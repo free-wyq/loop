@@ -11,14 +11,13 @@
 # 装到 POSIX 中立路径（不进任何 agent 私有目录）：
 #   代码  ~/.local/share/loop
 #   命令  ~/.local/bin/loop          (自驱入口，透传参数给 orchestrator.ts)
-#   配置  ~/.config/loop-tick.conf
+#   配置  ~/.config/loop.env          (密钥/限额，chmod 600)
 set -euo pipefail
 
 REPO_URL="https://github.com/free-wyq/loop.git"
 DEST="${LOOP_HOME:-$HOME/.local/share/loop}"
 BIN_DIR="${LOOP_BIN:-$HOME/.local/bin}"
 CONF_DIR="${LOOP_CONF:-$HOME/.config}"
-CONF_FILE="$CONF_DIR/loop-tick.conf"
 
 # 卸载时扫这些 skills 目录清 loop-scheduler（symlink / 真目录拷贝都清）。
 # 只列常见 agent 作默认、尽力而为；新 agent 不在列表里时，export LOOP_SKILL_DIRS=<dir>:<dir>
@@ -95,10 +94,7 @@ exec "'"$DEST"'/node_modules/.bin/tsx" "'"$DEST"'/orchestrator.ts" "$@"
 '
   chmod +x "$BIN_DIR/loop"
 
-  # 4. 配置文件模板
-  [ -f "$CONF_FILE" ] || cp "$DEST/skill/loop-tick.conf.example" "$CONF_FILE"
-
-  # 5. 配置模板：loop.env.example 拷到 ~/.config（不覆盖已有，已有让用户自己改——含密钥）
+  # 4. 配置模板：loop.env.example 拷到 ~/.config（不覆盖已有，已有让用户自己改——含密钥）
   if [ ! -f "$CONF_DIR/loop.env" ] && [ -f "$DEST/loop.env.example" ]; then
     cp "$DEST/loop.env.example" "$CONF_DIR/loop.env"
     chmod 600 "$CONF_DIR/loop.env"
@@ -142,13 +138,7 @@ do_uninstall() {
     if [ -e "$f" ] || [ -L "$f" ]; then rm -f "$f" "$f.bak"; removed=1; fi
   done
 
-  # 2. 配置文件是用户数据 → 备份再删（误卸能恢复）
-  if [ -e "$CONF_FILE" ]; then
-    mv "$CONF_FILE" "$CONF_FILE.bak" 2>/dev/null || rm -f "$CONF_FILE"
-    say "配置已备份 → $CONF_FILE.bak"
-    removed=1
-  fi
-  # loop.env 含密钥，同样备份再删（不静默抹）
+  # 2. loop.env 含密钥 → 备份再删（不静默抹）
   local loop_env="$CONF_DIR/loop.env"
   if [ -e "$loop_env" ]; then
     mv "$loop_env" "$loop_env.bak" 2>/dev/null || rm -f "$loop_env"

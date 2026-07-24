@@ -81,7 +81,6 @@ const hasLimit = (n: number) => n > 0;
 
 const TASK_FILE = ".task.md";
 const LOG_FILE = "night_run.log";
-const STATUS_FILE = ".status";          // 派生的人类可读快照（--status 主读 state.json，这个留兜底）
 const MEMO_DIR = ".claude/memory";
 const SESSION_FILE = ".session_id";      // session_id 单源（不进 state.json）
 const PID_FILE = ".pid";                // --watch 进程的 PID
@@ -131,31 +130,6 @@ function log(msg: string) {
   const line = `[${now()}] ${msg}`;
   console.log(line);
   appendFileSync(LOG_FILE, line + "\n");
-}
-
-interface Status {
-  last_heartbeat: string;
-  status: string;
-  current_task: string;
-  remaining: number;
-  completed: number;
-  cost_usd: number;
-}
-
-function writeStatus(s: Omit<Status, "last_heartbeat">) {
-  const st: Status = { last_heartbeat: now(), ...s };
-  writeFileSync(STATUS_FILE,
-    `last_heartbeat: ${st.last_heartbeat}\nstatus: ${st.status}\ncurrent_task: ${st.current_task}\nremaining: ${st.remaining}\ncompleted: ${st.completed}\ncost_usd: ${st.cost_usd.toFixed(4)}\n`);
-}
-
-function readStatus(): Partial<Status> | null {
-  if (!existsSync(STATUS_FILE)) return null;
-  const obj: Record<string, string> = {};
-  for (const line of readFileSync(STATUS_FILE, "utf8").split("\n")) {
-    const idx = line.indexOf(": ");
-    if (idx > 0) obj[line.slice(0, idx)] = line.slice(idx + 2);
-  }
-  return obj as unknown as Partial<Status>;
 }
 
 // ---- 任务文件读写（.task.md 格式）----
@@ -594,7 +568,6 @@ async function tick(): Promise<TickOutcome> {
         state.last_tick_at = now();
         state.last_tick_id = tickId;
         writeStateJsonAtomic(state);
-        writeStatus({ status: "blocked_suspect", current_task: `疑假完成·${blocked > 0 ? `${blocked} 阻塞` : "零commit"}`, remaining: 0, completed: total, cost_usd: state.total_cost_usd });
         appendEvent("tick_completed", { outcome: "terminated" }, { tick_id: tickId, loop_count: state.loop_count });
         return { kind: "terminated" };
       }
@@ -605,7 +578,6 @@ async function tick(): Promise<TickOutcome> {
       state.last_tick_at = now();
       state.last_tick_id = tickId;
       writeStateJsonAtomic(state);
-      writeStatus({ status: "completed", current_task: "全部完成", remaining: 0, completed: total, cost_usd: state.total_cost_usd });
       appendEvent("tick_completed", { outcome: "terminated" }, { tick_id: tickId, loop_count: state.loop_count });
       return { kind: "terminated" };
     }
@@ -626,7 +598,6 @@ async function tick(): Promise<TickOutcome> {
       state.last_tick_at = now();
       state.last_tick_id = tickId;
       writeStateJsonAtomic(state);
-      writeStatus({ status: "budget_exceeded", current_task: "预算耗尽", remaining, completed: total - remaining, cost_usd: state.total_cost_usd });
       appendEvent("tick_completed", { outcome: "terminated" }, { tick_id: tickId, loop_count: state.loop_count });
       return { kind: "terminated" };
     }
@@ -645,7 +616,6 @@ async function tick(): Promise<TickOutcome> {
     state.last_tick_at = now();
     state.last_tick_id = tickId;
     writeStateJsonAtomic(state);
-    writeStatus({ status: "running", current_task: taskLine, remaining, completed: total - remaining, cost_usd: state.total_cost_usd });
     log("━".repeat(60));
     log(`🔄 第 ${state.loop_count} 轮 | 剩余 ${remaining}/${total} | tick_id=${tickId}`);
     log(`📋 ${taskLine}`);
@@ -708,7 +678,6 @@ async function tick(): Promise<TickOutcome> {
       }
       state.status = "ctx_overflow_retry";
       const { remaining: newRem } = readTasks();
-      writeStatus({ status: "ctx-overflow-retry", current_task: taskLine, remaining: newRem, completed: total - newRem, cost_usd: state.total_cost_usd });
       appendEvent("tick_completed", { outcome: "session_dropped" }, { tick_id: tickId, loop_count: state.loop_count });
       return { kind: "session_dropped" };
     }
@@ -725,7 +694,6 @@ async function tick(): Promise<TickOutcome> {
       state.last_tick_at = now();
       writeStateJsonAtomic(state);
       const { remaining: newRem } = readTasks();
-      writeStatus({ status: "idle", current_task: taskLine, remaining: newRem, completed: total - newRem, cost_usd: state.total_cost_usd });
       appendEvent("tick_completed", { outcome: "blocked" }, { tick_id: tickId, loop_count: state.loop_count });
       return { kind: "blocked" };
     }
@@ -756,13 +724,10 @@ async function tick(): Promise<TickOutcome> {
       }
     }
 
-    // 步骤16: 写 state.json + 派生 .status 快照 + tick_completed
+    // 步骤16: 写 state.json + tick_completed
     state.status = "idle";
     state.last_tick_at = now();
     writeStateJsonAtomic(state);
-    const { remaining: newRem } = readTasks();
-    writeStatus({ status: "idle", current_task: taskLine, remaining: newRem, completed: total - newRem, cost_usd: state.total_cost_usd });
-
     const outcome: TickOutcome["kind"] = didRealWork ? "advanced" : (state.stall_count > 0 ? "stalled" : "blocked");
     appendEvent("tick_completed", { outcome }, { tick_id: tickId, loop_count: state.loop_count });
     return didRealWork ? { kind: "advanced" } : (state.stall_count > 0 ? { kind: "stalled" } : { kind: "blocked" });

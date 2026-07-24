@@ -71,7 +71,7 @@ loop-orchestrator（`orchestrator.ts`，用 `@anthropic-ai/claude-agent-sdk` 的
 curl -fsSL https://raw.githubusercontent.com/free-wyq/loop/main/install.sh | bash
 ```
 
-装到中立路径：代码 `~/.local/share/loop`、命令 `~/.local/bin/loop`、配置 `~/.config/loop-tick.conf`。不碰 shell rc、不替用户装 Node、不静默覆盖（已有备份 `.bak`）。
+装到中立路径：代码 `~/.local/share/loop`、命令 `~/.local/bin/loop`、配置 `~/.config/loop.env`（密钥/限额）。不碰 shell rc、不替用户装 Node、不静默覆盖（已有备份 `.bak`）。
 
 ## 用法
 
@@ -148,4 +148,4 @@ cp ~/.local/share/loop/loop.env.example ~/.config/loop.env && chmod 600 ~/.confi
 2. **目标项目绝不能是 loop 仓库自身**——会污染 git 历史。
 3. **推进靠 watch 长进程**——它崩了需重启才继续。要无人值守自动拉起，靠 systemd `Restart=always` / supervisor / claw 守护。
 4. **orchestrator 不发战报**——只把结果结构化到 state/events，战报由 claw 等 agent 读结果自行发。
-5. **改目标项目改 `~/.config/loop-tick.conf` 的 `LOOP_PROJECT`**，别改 orchestrator。
+5. **改目标项目换 `--cwd`**，别改 orchestrator。

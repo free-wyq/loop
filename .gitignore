@@ -1,16 +1,10 @@
-# 临时运行产物
+# 运行产物（写进目标项目目录）
 night_run.log
-.status
-.pid.main
-.pid.watchdog
-.pid
-.session_id
-.task.md
-.task.md.raw
-
-# tick 化新增产物
 state.json
 events.jsonl
+.task.md
+.session_id
+.pid
 .stop
 .tick.lock
 .tick.lock.lock

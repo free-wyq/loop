@@ -242,7 +242,7 @@ loop 升级后重跑上述命令刷新 skill 内容。详见 [install.md](instal
 
 - e2e happy path：2 任务全跑通、2 commit、events 配对完整、state.json 正确
 - **崩溃恢复**：`kill -9` 后 state.json 完好、.task.md 未误打勾、锁 stale 自动 takeover、loop_count 不丢、下次 tick 从崩溃处续跑
-- flock 并发：两个 `--tick` 同时，第二个立即 already_running
+- flock 并发：两个 watch 同时，第二个立即 already_running
 - `--stop` 哨兵：watch 收 SIGTERM 退出 + 写 .stop，`--resume` 恢复
 - 假完成守卫：全 `[x]` 零 commit → 疑假完成，不设 last_termination 待人工介入
 
