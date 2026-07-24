@@ -4,6 +4,7 @@
 #   安装：  curl -fsSL https://raw.githubusercontent.com/free-wyq/loop/main/install.sh | bash
 #   卸载：  curl -fsSL https://raw.githubusercontent.com/free-wyq/loop/main/install.sh | bash -s -- uninstall
 #           （已装好则直接：bash ~/.local/share/loop/install.sh uninstall）
+#           清理新 agent 的 skill 拷贝：export LOOP_SKILL_DIRS=<dir>:<dir> 后再 uninstall
 #   重装：  ... | bash -s -- reinstall    （= 干净卸载后全新安装，解决 node_modules 脏 / 代码树卡住）
 #   升级：  重跑安装命令即可（增量：git pull + npm install，保留你的本地改动与配置）
 #
@@ -20,12 +21,22 @@ BIN_DIR="${LOOP_BIN:-$HOME/.local/bin}"
 CONF_DIR="${LOOP_CONF:-$HOME/.config}"
 CONF_FILE="$CONF_DIR/loop-tick.conf"
 
-# 已知 agent 的 skills 目录 —— 卸载时扫这里的 loop-scheduler symlink（指向我们或已悬空）清掉
+# 卸载时扫这些 skills 目录清 loop-scheduler（symlink / 真目录拷贝都清）。
+# 只列常见 agent 作默认、尽力而为；新 agent 不在列表里时，export LOOP_SKILL_DIRS=<dir>:<dir>
+# 追加即可（无需改脚本）。注册时 agent 自由挑 skills 目录，卸载就靠这份列表 + 该扩展口找回来。
 AGENT_SKILL_DIRS=(
   "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.gemini/skills"
   "$HOME/.cursor/skills" "$HOME/.codeium/skills" "$HOME/.windsurf/skills"
   "$HOME/.hermes/skills"
 )
+# 扩展点：LOOP_SKILL_DIRS 冒号分隔，追加到已知列表（卸载循环幂等，重复条目无害，不去重）
+if [ -n "${LOOP_SKILL_DIRS:-}" ]; then
+  _saved_ifs="$IFS"; IFS=:
+  for _d in $LOOP_SKILL_DIRS; do
+    [ -n "$_d" ] && AGENT_SKILL_DIRS+=("$_d")
+  done
+  IFS="$_saved_ifs"
+fi
 
 say()  { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$*"; }
@@ -114,6 +125,7 @@ exec "'"$DEST"'/node_modules/.bin/tsx" "'"$DEST"'/orchestrator.ts" "$@"
   echo
   echo "  注册 skill（可选；多数 agent 的扫描器不跟 symlink，要拷真目录）："
   echo "    cp -r $DEST/skill ~/.claude/skills/loop-scheduler   # Claude Code（换 agent 换目录）"
+  echo "  卸载时清理该 agent 的 skill 拷贝：export LOOP_SKILL_DIRS=<skills-dir> 后再 uninstall"
   echo "  卸载：bash $DEST/install.sh uninstall"
 }
 

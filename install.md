@@ -61,6 +61,6 @@ rm -rf "$SKILLS_DIR/loop-scheduler"
 cp -r ~/.local/share/loop/skill "$SKILLS_DIR/loop-scheduler"
 ```
 
-卸载时删那个真目录：`rm -rf "$SKILLS_DIR/loop-scheduler"`（`install.sh uninstall` 也会顺带清各已知 agent 目录下的 loop-scheduler，无论 symlink 还是真目录）。
+卸载时删那个真目录：`rm -rf "$SKILLS_DIR/loop-scheduler"`（`install.sh uninstall` 也会顺带清各已知 agent 目录下的 loop-scheduler，无论 symlink 还是真目录）。你用的 agent 若不在默认列表里，卸载前 `export LOOP_SKILL_DIRS=<skills-dir>:<skills-dir>` 再 uninstall，脚本会一并清理。
 
 ⚠️ `--cwd` 指向你要开发的目标项目（orchestrator 往那写产物 + git commit）。**别指向 loop 仓库自身。**
