@@ -1,14 +1,6 @@
 ---
 name: loop-scheduler
 description: "loop-orchestrator 接入：--watch 长进程自管推进，结果结构化到 state.json/events.jsonl。外部 agent（如 claw）定时读这些结果自行组织发战报。orchestrator 不发战报、不依赖外部触发推进。"
-version: 2.1.0
-author: free-wyq
-license: MIT
-platforms: [linux, macos]
-metadata:
-  hermes:
-    tags: [automation, scheduler, unattended, orchestrator, claude-agent-sdk]
-    related_skills: [claude-code]
 ---
 
 # Loop Scheduler
